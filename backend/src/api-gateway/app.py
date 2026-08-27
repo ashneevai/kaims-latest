@@ -1906,6 +1906,60 @@ async def _load_analysis_regeneration_subject(
                 .limit(1)
             )
         ).scalar_one_or_none()
+        if projection_record is None and alert_record.fingerprint:
+            # A canonical incident projection stores one representative alert
+            # ID, while later deduplicated occurrences retain their own alert
+            # IDs. Fresh analysis must resolve those occurrences through the
+            # stable fingerprint instead of incorrectly treating them as
+            # uncorrelated alerts.
+            projection_record = (
+                await session.execute(
+                    select(IncidentProjectionRecord)
+                    .join(AlertRecord, IncidentProjectionRecord.alert_id == AlertRecord.id)
+                    .where(
+                        IncidentProjectionRecord.tenant_id == tenant_id,
+                        IncidentProjectionRecord.service == alert_record.service,
+                        IncidentProjectionRecord.environment == alert_record.environment,
+                        AlertRecord.tenant_id == tenant_id,
+                        AlertRecord.fingerprint == alert_record.fingerprint,
+                    )
+                    .order_by(
+                        IncidentProjectionRecord.latest_event_at.desc(),
+                        IncidentProjectionRecord.updated_at.desc(),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        if projection_record is None:
+            # Some legacy correlation failures persisted the incident and its
+            # projection without carrying the source alert ID into the
+            # projection. Resolve only an exact service/environment/title
+            # match so an operator can retry that alert without accidentally
+            # attaching analysis to a different incident on the same service.
+            incident_record = (
+                await session.execute(
+                    select(IncidentRecord)
+                    .where(
+                        IncidentRecord.tenant_id == tenant_id,
+                        IncidentRecord.service == alert_record.service,
+                        IncidentRecord.environment == alert_record.environment,
+                        IncidentRecord.title == f"{alert_record.service}: {alert_record.name}",
+                    )
+                    .order_by(IncidentRecord.created_at.desc(), IncidentRecord.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if incident_record is not None:
+                projection_record = (
+                    await session.execute(
+                        select(IncidentProjectionRecord)
+                        .where(
+                            IncidentProjectionRecord.incident_id == incident_record.id,
+                            IncidentProjectionRecord.tenant_id == tenant_id,
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
         if projection_record is None:
             raise HTTPException(
                 status_code=409,
@@ -1941,6 +1995,7 @@ async def _load_analysis_regeneration_subject(
                 "correlation_id": alert_record.correlation_id,
             }
         )
+        alert_payload = {key: value for key, value in alert_payload.items() if key in Alert.model_fields}
         incident_payload = dict(incident_record.payload) if isinstance(incident_record.payload, dict) else {}
         incident_payload.update(
             {
@@ -1954,6 +2009,7 @@ async def _load_analysis_regeneration_subject(
                 "ticket_id": incident_record.ticket_id,
             }
         )
+        incident_payload = {key: value for key, value in incident_payload.items() if key in Incident.model_fields}
         projection_payload = (
             projection_record.projection_payload
             if isinstance(projection_record.projection_payload, dict)

@@ -444,6 +444,96 @@ async def test_analysis_regeneration_rejects_alert_without_persisted_incident(mo
 
 
 @pytest.mark.asyncio
+async def test_analysis_regeneration_resolves_deduplicated_alert_by_fingerprint(monkeypatch, sqlite_session_factory) -> None:
+    module = load_api_gateway_app_module()
+    canonical_alert_uuid = uuid4()
+    duplicate_alert_uuid = uuid4()
+    incident_uuid = uuid4()
+    captured: dict = {}
+    fingerprint = "stable-alert-fingerprint"
+
+    async with sqlite_session_factory() as session:
+        for alert_uuid in (canonical_alert_uuid, duplicate_alert_uuid):
+            session.add(AlertRecord(
+                id=alert_uuid, tenant_id="tenant-a", source="prometheus", name="RepeatedAlert",
+                service="api-gateway", environment="prod", severity="critical",
+                fingerprint=fingerprint, payload={"description": "repeated alert occurrence"},
+            ))
+        session.add(IncidentRecord(
+            id=incident_uuid, tenant_id="tenant-a", service="api-gateway", environment="prod",
+            severity="critical", status="investigating", title="Canonical incident", payload={},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_uuid, alert_id=canonical_alert_uuid,
+            tenant_id="tenant-a", service="api-gateway", environment="prod", severity="critical",
+            status="investigating", projection_payload={},
+        ))
+        await session.commit()
+
+    async def publish_stub(**kwargs):
+        captured.update(kwargs)
+        return "published"
+
+    monkeypatch.setattr(module, "_publish_analysis_regeneration_command", publish_stub)
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+
+    result = await module.regenerate_alert_analysis(
+        str(duplicate_alert_uuid), SimpleNamespace(app=module.app), payload={"mode": "fresh"},
+        x_trace_id=None, tenant_id="tenant-a",
+    )
+
+    assert result["status"] == "accepted"
+    assert result["alert_id"] == str(duplicate_alert_uuid)
+    assert result["incident_id"] == str(incident_uuid)
+    assert captured["alert"].id == duplicate_alert_uuid
+    assert captured["incident"].id == incident_uuid
+
+
+@pytest.mark.asyncio
+async def test_analysis_regeneration_resolves_legacy_projection_without_alert_id(monkeypatch, sqlite_session_factory) -> None:
+    module = load_api_gateway_app_module()
+    alert_uuid = uuid4()
+    incident_uuid = uuid4()
+    captured: dict = {}
+
+    async with sqlite_session_factory() as session:
+        session.add(AlertRecord(
+            id=alert_uuid, tenant_id="tenant-a", source="prometheus", name="RepeatedAlert",
+            service="api-gateway", environment="prod", severity="critical",
+            fingerprint="orphaned-projection-fingerprint",
+            payload={"description": "retry me", "raw_provider_field": "must not leak"},
+        ))
+        session.add(IncidentRecord(
+            id=incident_uuid, tenant_id="tenant-a", service="api-gateway", environment="prod",
+            severity="critical", status="failed", title="api-gateway: RepeatedAlert",
+            payload={"legacy_projection_field": "must not leak"},
+        ))
+        session.add(IncidentProjectionRecord(
+            incident_id=incident_uuid, alert_id=None, tenant_id="tenant-a",
+            service=str(incident_uuid), environment="prod", severity="critical",
+            status="failed", projection_payload={},
+        ))
+        await session.commit()
+
+    async def publish_stub(**kwargs):
+        captured.update(kwargs)
+        return "published"
+
+    monkeypatch.setattr(module, "_publish_analysis_regeneration_command", publish_stub)
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+
+    result = await module.regenerate_alert_analysis(
+        str(alert_uuid), SimpleNamespace(app=module.app), payload={"mode": "fresh"},
+        x_trace_id=None, tenant_id="tenant-a",
+    )
+
+    assert result["status"] == "accepted"
+    assert result["incident_id"] == str(incident_uuid)
+    assert captured["alert"].id == alert_uuid
+    assert captured["incident"].id == incident_uuid
+
+
+@pytest.mark.asyncio
 async def test_analysis_request_status_is_lightweight_and_tenant_scoped(monkeypatch, sqlite_session_factory) -> None:
     module = load_api_gateway_app_module()
     request_uuid = uuid4()
