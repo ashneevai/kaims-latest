@@ -590,6 +590,43 @@ async def test_resolution_agent_prefers_model_risk_level_over_severity_heuristic
 
 
 @pytest.mark.asyncio
+async def test_resolution_agent_marks_uncited_analysis_unavailable_and_keeps_action_service_scoped() -> None:
+    class UngroundedGateway:
+        async def generate(self, request) -> dict:
+            content = {
+                "root_cause": "Root cause not established: no direct service telemetry is linked.",
+                "confidence_score": 0.35,
+                "evidence_used": [],
+                "recommended_action": "Collect gateway diagnostics for a different-service.",
+            }
+            return {
+                "model": "test-model",
+                "content": json.dumps(content),
+                "usage": {"provider": "test", "model": "test-model", "task": request.task},
+            }
+
+    alert = Alert(
+        tenant_id="tenant-a", source="prometheus", name="AutomationExecutionFailure",
+        service="remediation-engine", severity=AlertSeverity.CRITICAL,
+        description="Remediation engine reported a non-ok event processing result.",
+    )
+    incident = Incident(
+        tenant_id="tenant-a", service="remediation-engine", severity=AlertSeverity.CRITICAL,
+        title="remediation-engine: AutomationExecutionFailure",
+    )
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    agent = ResolutionIntelligenceAgent(model_gateway=UngroundedGateway())
+    agent.deep_analysis_enabled = True
+
+    recommendation = await agent.resolve(context)
+
+    assert recommendation.confidence == 0.0
+    assert recommendation.metadata["rca_analysis"]["evidence_used"] == []
+    assert recommendation.recommended_action.endswith("for remediation-engine.")
+    assert "different-service" not in recommendation.recommended_action
+
+
+@pytest.mark.asyncio
 async def test_resolution_agent_ignores_unrecognized_model_risk_level() -> None:
     class BadRiskGateway:
         async def generate(self, request) -> dict:

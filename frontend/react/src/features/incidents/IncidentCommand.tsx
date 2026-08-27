@@ -203,7 +203,9 @@ export default function IncidentCommand() {
   const after = record(validation.after || validation.post_state);
   const analysis = firstRecord(projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, source.analysis);
   const rootCause = text(row.root_cause, projection.root_cause, eventPayload.root_cause, analysis.root_cause, analysis.leading_hypothesis, recommendation.root_cause, recommendationMetadata.root_cause, sourceAnnotations.root_cause);
-  const confidence = confidenceValue(row.confidence, projection.confidence, eventPayload.confidence, analysis.confidence, recommendation.confidence, recommendationMetadata.confidence);
+  const acceptedEvidence = arrayOfText(analysis.evidence_used);
+  const publishedConfidence = confidenceValue(row.confidence, projection.confidence, eventPayload.confidence, analysis.confidence, recommendation.confidence, recommendationMetadata.confidence);
+  const confidence = acceptedEvidence.length > 0 && publishedConfidence !== 0 ? publishedConfidence : null;
   const supportingReasons = [
     ...arrayOfText(analysis.supporting_signals),
     ...arrayOfText(analysis.evidence),
@@ -268,7 +270,7 @@ export default function IncidentCommand() {
         </section>
 
         <section className="ic-section ic-rca">
-          <header><div><span>Root cause story</span><h3>{rootCause || "Kai has not published a root-cause hypothesis"}</h3></div>{confidence !== null ? <div className="ic-confidence"><small>{confidence >= 80 ? "High" : confidence >= 60 ? "Medium" : "Low"} confidence</small><strong>{confidence}%</strong></div> : <StatusBadge tone="inactive">Confidence unavailable</StatusBadge>}</header>
+          <header><div><span>Root cause story</span><h3>{rootCause || "Kai has not published a root-cause hypothesis"}</h3></div>{confidence !== null ? <div className="ic-confidence"><small>{confidence >= 80 ? "High" : confidence >= 60 ? "Medium" : "Low"} confidence</small><strong>{confidence}%</strong></div> : <StatusBadge tone="inactive">Insufficient evidence</StatusBadge>}</header>
           {rootCause ? <>
             <div className="ic-reasoning"><article><h4>Why Kai thinks this</h4>{supportingReasons.length ? <ul>{supportingReasons.map((reason) => <li key={reason}><CheckCircle2 aria-hidden="true" />{reason}</li>)}</ul> : <p>Supporting reasons were not included in the backend analysis.</p>}</article><article><h4>What Kai ruled out</h4>{contradictions.length ? <ul>{contradictions.map((reason) => <li key={reason}><X aria-hidden="true" />{reason}</li>)}</ul> : <p>No ruled-out hypotheses were included.</p>}</article></div>
             <TechnicalDetails summary="Why this confidence?"><p>{confidence === null ? "The backend did not publish a confidence score." : `${confidence}% is the normalized score published with this incident analysis.`}</p><p>{supportingReasons.length} supporting reason(s) and {contradictions.length} contradiction or ruled-out item(s) are available.</p></TechnicalDetails>
@@ -277,10 +279,9 @@ export default function IncidentCommand() {
 
         <section className="ic-section ic-causal">
           <header><div><span>Relevant causal path</span><h3>How the signal connects to impact</h3></div><GitBranch aria-hidden="true" /></header>
-          <div className="ic-causal-path">
-            {[text(rootCause), text(row.service), titleFor(row), impact].filter((value, index, values) => value && values.indexOf(value) === index).map((value, index, values) => <div key={value}><button type="button"><span>{index === 0 && rootCause ? "Hypothesis" : index === values.length - 1 ? "Observed impact" : "Affected component"}</span><strong>{value}</strong></button>{index < values.length - 1 ? <ArrowDown aria-hidden="true" /> : null}</div>)}
-          </div>
-          {!rootCause && !impact ? <p className="ic-unavailable">The backend has not supplied enough evidence to construct a causal path.</p> : null}
+          {acceptedEvidence.length ? <div className="ic-causal-path">
+            {[text(rootCause), text(row.service), impact].filter((value, index, values) => value && values.indexOf(value) === index).map((value, index, values) => <div key={value}><button type="button"><span>{index === 0 && rootCause ? "Hypothesis" : index === values.length - 1 ? "Observed impact" : "Affected component"}</span><strong>{value}</strong></button>{index < values.length - 1 ? <ArrowDown aria-hidden="true" /> : null}</div>)}
+          </div> : <p className="ic-unavailable">Insufficient linked evidence to construct a causal path. The alert, service, and impact remain separate observations.</p>}
         </section>
 
         <section className="ic-section ic-resolution">

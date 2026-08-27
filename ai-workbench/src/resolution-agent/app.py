@@ -241,9 +241,10 @@ async def _resolve_context(context: Context) -> Recommendation:
                     "Investigation inconclusive: the collected evidence does not independently corroborate a causal hypothesis."
                 )
                 recommendation.recommended_action = (
-                    f"Collect the next required read-only evidence ({missing or 'missing application sources'}) and rerun resolution."
+                    f"Collect the next required read-only evidence for {context.alert.service} "
+                    f"({missing or 'missing application sources'}) and rerun resolution."
                 )
-                recommendation.confidence = min(float(recommendation.confidence), 0.49)
+                recommendation.confidence = 0.0
                 recommendation.metadata["resolution_outcome"] = "inconclusive"
             _attach_resolution_options(recommendation, context, investigation_report)
         recommendation.metadata = {

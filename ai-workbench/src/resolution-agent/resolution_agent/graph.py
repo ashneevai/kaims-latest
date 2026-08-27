@@ -1391,6 +1391,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             str(state.get("root_cause") or ""),
             model_action,
         )
+        accepted_evidence = state.get("rca_analysis", {}).get("evidence_used", [])
+        if not accepted_evidence:
+            # An uncited model suggestion is not a remediation recommendation.
+            # Keep the next step diagnostic and bind it to the alert service so
+            # stale or hallucinated service names cannot enter the UI or plan.
+            action = (
+                "Do not execute remediation yet. Collect service-matched telemetry, logs/traces, "
+                f"dependency health, and recent changes for {context.alert.service}."
+            )
         state["remediation_target"] = remediation_target
         state.setdefault("model_usage", []).append(response["usage"])
         state.setdefault("model_calls", []).append(
@@ -1487,7 +1496,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         if state.get("gathered_context", {}).get("discovery_evidence"):
             score += 0.03
         if not state.get("rca_analysis", {}).get("evidence_used"):
-            score = min(score, 0.49)
+            score = 0.0
         evidence_ceiling = float(
             state.get("rca_analysis", {}).get("evidence_quality", {}).get("confidence_ceiling") or 0.49
         )
@@ -1509,7 +1518,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         if fallback_hits >= max(1, len(state.get("model_usage", []))):
             score = min(score, 0.49)
 
-        state["confidence"] = round(max(0.05, min(score, 0.99)), 4)
+        state["confidence"] = round(max(0.0, min(score, 0.99)), 4)
         return state
 
     async def resolve(self, context: Context) -> Recommendation:
@@ -1790,8 +1799,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
     async def validate(self, result: Any) -> bool:
         if not isinstance(result, Recommendation):
             return False
-        if result.confidence <= 0:
-            raise ValidationError("confidence must be greater than zero")
+        if result.confidence < 0:
+            raise ValidationError("confidence must not be negative")
         evidence_ids = result.metadata.get("evidence_ids", [])
         if not isinstance(evidence_ids, list) or not evidence_ids:
             raise ValidationError("recommendation must include evidence_ids")
