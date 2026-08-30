@@ -15,7 +15,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal
 from urllib.parse import quote
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
 from ai_workbench_common.model_evaluation import build_quality_evaluation
@@ -41,7 +41,7 @@ from common.models import (
 )
 from common.object_storage import build_object_storage
 from common.orchestration.execution_plan import resolve_execution_plan
-from common.repository import IncidentRepository, ObjectStorageRepository
+from common.repository import ContextEnrichmentRepository, IncidentRepository, ObjectStorageRepository
 from common.service import create_app
 from common.telemetry import EVENT_CONTRACTS_EMITTED, EVENT_PUBLISH_LATENCY
 from common.topics import (
@@ -1826,6 +1826,113 @@ async def _jira_poll_worker() -> None:
             continue
 
 
+async def _jira_action_worker() -> None:
+    stop_event = app.state.monitoring_adapter_stop_event
+    client = _jira_api_client()
+    if client is None:
+        logger.warning("jira_action_worker_disabled reason=api credentials are incomplete")
+        return
+    worker_id = f"monitoring-adapter:{os.getpid()}"
+    try:
+        while not stop_event.is_set():
+            try:
+                async with app.state.session_factory() as session:
+                    repo = ContextEnrichmentRepository(session)
+                    rows = await repo.claim_jira_actions(worker_id=worker_id, limit=10, lease_seconds=120)
+                    actions = [{
+                        "action_id": row.action_id,
+                        "tenant_id": row.tenant_id,
+                        "jira_connection_id": row.jira_connection_id,
+                        "incident_id": row.incident_id,
+                        "action_type": row.action_type,
+                        "idempotency_key": row.idempotency_key,
+                        "attempt_count": row.attempt_count,
+                        "payload": dict(row.payload or {}),
+                    } for row in rows]
+                    await session.commit()
+                for action in actions:
+                    try:
+                        if action["action_type"] != "ensure_hitl_issue":
+                            raise ValueError(f"unsupported queued Jira action {action['action_type']}")
+                        payload = action["payload"]
+                        issue_key, _ = await client.create_or_update_incident(
+                            incident_id=str(action["incident_id"]),
+                            summary=str(payload.get("summary") or "KaiMS evidence request"),
+                            description=(
+                                f"KaiMS incident: {action['incident_id']}\n"
+                                f"Evidence request: {payload.get('question') or 'See KaiMS incident'}\n"
+                                f"Due: {payload.get('due_at') or 'Not specified'}"
+                            ),
+                            severity=str(payload.get("severity") or "high"),
+                            labels={"purpose": "human-evidence"},
+                            idempotency_key=action["idempotency_key"],
+                        )
+                        await client.assign_issue(
+                            issue_key, account_id=str(payload["assignee_account_id"]),
+                        )
+                        issue = await client.get_issue(issue_key)
+                        binding_id = uuid5(
+                            NAMESPACE_URL,
+                            f"{action['tenant_id']}:{action['jira_connection_id']}:{issue_key}",
+                        )
+                        property_value = {
+                            key: payload.get(key)
+                            for key in (
+                                "schema", "incident_id", "hitl_request_id", "requirement_id",
+                                "purpose", "ownership", "closure_authority", "context_snapshot_id",
+                                "rca_version",
+                            )
+                        }
+                        property_value["binding_id"] = str(binding_id)
+                        await client.set_issue_property(
+                            issue_key,
+                            property_key="kaims.binding.v1",
+                            value=property_value,
+                            idempotency_key=action["idempotency_key"],
+                        )
+                        public_url = str(os.getenv("KAIMS_PUBLIC_URL", "") or "").strip().rstrip("/")
+                        if public_url:
+                            await client.add_remote_link(
+                                issue_key,
+                                url=f"{public_url}/incidents/{action['incident_id']}",
+                                title=f"KaiMS incident {action['incident_id']}",
+                            )
+                        async with app.state.session_factory() as session:
+                            repo = ContextEnrichmentRepository(session)
+                            await repo.bind_jira_hitl_issue(
+                                tenant_id=action["tenant_id"],
+                                jira_connection_id=action["jira_connection_id"],
+                                incident_id=action["incident_id"],
+                                jira_issue_key=issue_key,
+                                jira_issue_id=str(issue.get("id") or "") or None,
+                                jira_project_key=client.project_key,
+                                assignee_account_id=str(payload["assignee_account_id"]),
+                                payload=payload,
+                            )
+                            await repo.mark_jira_action_complete(
+                                action_id=action["action_id"], worker_id=worker_id,
+                            )
+                            await session.commit()
+                    except Exception as exc:
+                        async with app.state.session_factory() as session:
+                            await ContextEnrichmentRepository(session).retry_jira_action(
+                                action_id=action["action_id"], worker_id=worker_id,
+                                error=str(exc), retry_after_seconds=min(900, 30 * 2 ** min(action["attempt_count"], 5)),
+                            )
+                            await session.commit()
+                        logger.exception("governed Jira action failed", extra={"action_id": str(action["action_id"])})
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Jira action worker scan failed")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                continue
+    finally:
+        await client.close()
+
+
 async def _on_startup(_: Any) -> None:
     app.state.monitoring_adapter_stop_event = asyncio.Event()
     if INCIDENT_PROJECTION_WORKER_ENABLED:
@@ -1847,6 +1954,10 @@ async def _on_startup(_: Any) -> None:
             app.state.jira_poll_task = asyncio.create_task(_jira_poll_worker())
         else:
             logger.warning("JIRA_POLLING_ENABLED is true but Jira API credentials are incomplete")
+    if settings.database_enabled and all((
+        JIRA_API_BASE_URL, JIRA_API_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, JIRA_ISSUE_TYPE,
+    )):
+        app.state.jira_action_task = asyncio.create_task(_jira_action_worker())
     if LOG_INGESTION_ENABLED:
         if LOG_WATCH_PATHS:
             app.state.log_poll_task = asyncio.create_task(_log_poll_worker())
@@ -1912,6 +2023,13 @@ async def _on_shutdown(_: Any) -> None:
         jira_task.cancel()
         try:
             await jira_task
+        except asyncio.CancelledError:
+            pass
+    jira_action_task = getattr(app.state, "jira_action_task", None)
+    if jira_action_task is not None:
+        jira_action_task.cancel()
+        try:
+            await jira_action_task
         except asyncio.CancelledError:
             pass
 

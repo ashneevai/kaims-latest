@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from collections.abc import Awaitable, Callable, Coroutine
@@ -430,6 +431,34 @@ async def persist_investigation_enrichment_plan(
                 investigation_can_continue=True,
             )
             request_ids.append(str(request.request_id))
+            jira_connection_id = str(metadata.get("jira_connection_id") or "").strip()
+            if jira_connection_id:
+                action_key = hashlib.sha256(
+                    f"{context.tenant_id}:{context.incident_id}:{request.request_id}:ensure_hitl_issue".encode()
+                ).hexdigest()
+                await repository.enqueue_jira_action(
+                    tenant_id=context.tenant_id,
+                    jira_connection_id=jira_connection_id,
+                    incident_id=context.incident_id,
+                    action_type="ensure_hitl_issue",
+                    idempotency_key=action_key,
+                    payload={
+                        "schema": "kaims.binding.v1",
+                        "incident_id": str(context.incident_id),
+                        "hitl_request_id": str(request.request_id),
+                        "requirement_id": str(requirement.requirement_id),
+                        "purpose": "human_evidence",
+                        "ownership": "human",
+                        "closure_authority": "jira",
+                        "context_snapshot_id": str(final_snapshot.snapshot_id),
+                        "context_fingerprint": str(final_snapshot.context_fingerprint),
+                        "rca_version": max(1, rca_version),
+                        "assignee_account_id": expected_responder,
+                        "summary": f"KaiMS evidence request: {context.alert.name}",
+                        "question": requirement.question,
+                        "due_at": request.due_at.isoformat(),
+                    },
+                )
         await session.commit()
     return {
         "requirement_ids": [str(row.requirement_id) for row in requirements],

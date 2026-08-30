@@ -47,7 +47,9 @@ from common.database import (
     HumanEvidenceRequestRecord,
     HumanEvidenceResponseVersionRecord,
     JiraIncidentBindingRecord,
+    JiraActionOutboxRecord,
     JiraSyncCursorRecord,
+    JiraWebhookReceiptRecord,
     KnowledgeRagDraftRecord,
     KnowledgeBaseRecord,
     LearningAuditRecord,
@@ -8626,4 +8628,215 @@ class ContextEnrichmentRepository(EvaluationRepository):
             raise LookupError("context enrichment job not found")
         if row.status != "collecting" or row.lease_owner != worker_id:
             raise RuntimeError("context enrichment job lease is not owned by this worker")
+        return row
+
+    async def enqueue_jira_action(
+        self,
+        *,
+        tenant_id: str,
+        jira_connection_id: UUID | str,
+        incident_id: UUID | str,
+        action_type: str,
+        idempotency_key: str,
+        payload: dict[str, Any],
+        binding_id: UUID | str | None = None,
+    ) -> JiraActionOutboxRecord:
+        tenant = require_tenant_id(tenant_id, source="Jira action")
+        connection_id = self._to_uuid(jira_connection_id)
+        connection = (await self.session.execute(select(MonitoringIntegrationRecord).where(
+            MonitoringIntegrationRecord.id == connection_id,
+            MonitoringIntegrationRecord.tenant_id == tenant,
+            MonitoringIntegrationRecord.provider.in_(("jira", "atlassian", "jira_cloud")),
+            MonitoringIntegrationRecord.active.is_(True),
+        ).with_for_update())).scalar_one_or_none()
+        if connection is None:
+            raise LookupError("active tenant Jira connection not found")
+        supported = {
+            "ensure_hitl_issue", "assign_issue", "add_comment", "transition_issue",
+            "add_remote_link", "set_issue_property", "reopen_issue",
+        }
+        if action_type not in supported:
+            raise ValueError("unsupported Jira action type")
+        key = self._require("jira_action.idempotency_key", idempotency_key)
+        existing = (await self.session.execute(select(JiraActionOutboxRecord).where(
+            JiraActionOutboxRecord.tenant_id == tenant,
+            JiraActionOutboxRecord.jira_connection_id == connection_id,
+            JiraActionOutboxRecord.idempotency_key == key,
+        ))).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        row = JiraActionOutboxRecord(
+            tenant_id=tenant,
+            jira_connection_id=connection_id,
+            incident_id=self._to_uuid(incident_id),
+            binding_id=self._to_uuid(binding_id) if binding_id else None,
+            action_type=action_type,
+            idempotency_key=key,
+            payload=dict(payload),
+            status="pending",
+            available_at=utc_now(),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def claim_jira_actions(
+        self, *, worker_id: str, limit: int, lease_seconds: int,
+    ) -> list[JiraActionOutboxRecord]:
+        now = utc_now()
+        rows = list((await self.session.execute(select(JiraActionOutboxRecord).where(
+            JiraActionOutboxRecord.status.in_(("pending", "retry")),
+            JiraActionOutboxRecord.available_at <= now,
+            or_(
+                JiraActionOutboxRecord.lease_expires_at.is_(None),
+                JiraActionOutboxRecord.lease_expires_at < now,
+            ),
+        ).order_by(JiraActionOutboxRecord.available_at, JiraActionOutboxRecord.created_at)
+        .limit(max(1, min(int(limit), 100))).with_for_update(skip_locked=True))).scalars().all())
+        for row in rows:
+            row.status = "processing"
+            row.attempt_count += 1
+            row.lease_owner = worker_id
+            row.lease_expires_at = now + timedelta(seconds=max(1, int(lease_seconds)))
+        await self.session.flush()
+        return rows
+
+    async def mark_jira_action_complete(self, *, action_id: UUID | str, worker_id: str) -> None:
+        row = await self._locked_jira_action(action_id=action_id, worker_id=worker_id)
+        row.status = "completed"
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.last_error = None
+        await self.session.flush()
+
+    async def retry_jira_action(
+        self, *, action_id: UUID | str, worker_id: str, error: str, retry_after_seconds: int,
+    ) -> None:
+        row = await self._locked_jira_action(action_id=action_id, worker_id=worker_id)
+        row.status = "retry"
+        row.available_at = utc_now() + timedelta(seconds=max(1, retry_after_seconds))
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.last_error = str(error)[:4000]
+        await self.session.flush()
+
+    async def _locked_jira_action(
+        self, *, action_id: UUID | str, worker_id: str,
+    ) -> JiraActionOutboxRecord:
+        row = (await self.session.execute(select(JiraActionOutboxRecord).where(
+            JiraActionOutboxRecord.action_id == self._to_uuid(action_id),
+        ).with_for_update())).scalar_one_or_none()
+        if row is None:
+            raise LookupError("Jira action not found")
+        if row.status != "processing" or row.lease_owner != worker_id:
+            raise RuntimeError("Jira action lease is not owned by this worker")
+        return row
+
+    async def record_jira_webhook_receipt(
+        self,
+        *,
+        tenant_id: str,
+        jira_connection_id: UUID | str,
+        jira_issue_id: str,
+        jira_updated_at: datetime,
+        event_id: str,
+        payload_checksum: str,
+        webhook_version: int = 1,
+    ) -> tuple[JiraWebhookReceiptRecord, bool]:
+        tenant = require_tenant_id(tenant_id, source="Jira webhook receipt")
+        connection_id = self._to_uuid(jira_connection_id)
+        existing = (await self.session.execute(select(JiraWebhookReceiptRecord).where(
+            JiraWebhookReceiptRecord.jira_connection_id == connection_id,
+            JiraWebhookReceiptRecord.event_id == event_id,
+        ))).scalar_one_or_none()
+        if existing is not None:
+            if existing.tenant_id != tenant:
+                raise PermissionError("Jira webhook receipt tenant mismatch")
+            return existing, False
+        row = JiraWebhookReceiptRecord(
+            tenant_id=tenant,
+            jira_connection_id=connection_id,
+            jira_issue_id=self._require("jira_issue_id", jira_issue_id),
+            jira_updated_at=jira_updated_at,
+            event_id=self._require("jira_event_id", event_id),
+            webhook_version=max(1, int(webhook_version)),
+            payload_checksum=self._require("payload_checksum", payload_checksum),
+            processing_status="received",
+            received_at=utc_now(),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row, True
+
+    async def bind_jira_hitl_issue(
+        self,
+        *,
+        tenant_id: str,
+        jira_connection_id: UUID | str,
+        incident_id: UUID | str,
+        jira_issue_key: str,
+        jira_issue_id: str | None,
+        jira_project_key: str,
+        assignee_account_id: str,
+        payload: dict[str, Any],
+    ) -> JiraIncidentBindingRecord:
+        tenant = require_tenant_id(tenant_id, source="Jira HITL binding")
+        connection_id = self._to_uuid(jira_connection_id)
+        incident_uuid = self._to_uuid(incident_id)
+        row = (await self.session.execute(select(JiraIncidentBindingRecord).where(
+            JiraIncidentBindingRecord.tenant_id == tenant,
+            JiraIncidentBindingRecord.jira_connection_id == connection_id,
+            JiraIncidentBindingRecord.jira_issue_key == jira_issue_key,
+        ).with_for_update())).scalar_one_or_none()
+        if row is not None:
+            if row.incident_id != incident_uuid:
+                raise ValueError("Jira issue is already bound to another incident")
+            return row
+        version = int((await self.session.execute(select(func.max(
+            JiraIncidentBindingRecord.binding_version
+        )).where(
+            JiraIncidentBindingRecord.tenant_id == tenant,
+            JiraIncidentBindingRecord.incident_id == incident_uuid,
+        ))).scalar_one_or_none() or 0) + 1
+        row = JiraIncidentBindingRecord(
+            tenant_id=tenant,
+            jira_connection_id=connection_id,
+            incident_id=incident_uuid,
+            jira_issue_key=self._require("jira_issue_key", jira_issue_key),
+            jira_issue_id=jira_issue_id,
+            jira_project_key=self._require("jira_project_key", jira_project_key),
+            assignee_id=self._require("assignee_account_id", assignee_account_id),
+            jira_assignee_account_id=assignee_account_id,
+            assignee_group=payload.get("assignee_group"),
+            recommendation_id=(
+                self._to_uuid(payload["recommendation_id"]) if payload.get("recommendation_id") else None
+            ),
+            rca_version=max(1, int(payload.get("rca_version") or 1)),
+            context_snapshot_id=self._to_uuid(payload["context_snapshot_id"]),
+            context_fingerprint=self._require("context_fingerprint", payload.get("context_fingerprint")),
+            resolution_selection_id=(
+                self._to_uuid(payload["resolution_selection_id"])
+                if payload.get("resolution_selection_id") else None
+            ),
+            execution_plan_id=(
+                self._to_uuid(payload["execution_plan_id"]) if payload.get("execution_plan_id") else None
+            ),
+            plan_fingerprint=payload.get("plan_fingerprint"),
+            approval_expires_at=payload.get("approval_expires_at"),
+            status="pending",
+            jira_status=str(payload.get("jira_status") or "Open"),
+            ownership="human",
+            closure_authority="jira",
+            binding_purpose="human_evidence",
+            hitl_request_id=self._to_uuid(payload["hitl_request_id"]),
+            closure_policy={"ownership": "human", "kaims_may_close": False},
+            binding_version=version,
+            webhook_version=1,
+        )
+        self.session.add(row)
+        await self.session.execute(update(HumanEvidenceRequestRecord).where(
+            HumanEvidenceRequestRecord.tenant_id == tenant,
+            HumanEvidenceRequestRecord.request_id == row.hitl_request_id,
+        ).values(response_payload={"jira_issue_key": jira_issue_key}))
+        await self.session.flush()
         return row
