@@ -3,12 +3,14 @@ from uuid import uuid4
 
 import pytest
 from ai_workbench_common.models import Context
-from common.context_enrichment_contract import EvidenceRequirement, HitlRoutingConfiguration
 from common.context_enrichment import plan_missing_evidence as plan_missing_evidence_shared
+from common.context_enrichment_contract import EvidenceRequirement, HitlRoutingConfiguration
+from common.database import HumanEvidenceResponseVersionRecord
 from common.models import Alert, AlertSeverity
 from common.repository import ContextEnrichmentRepository
 from context_agent.connectors import execute_enrichment_plan
 from context_agent.context_quality import plan_missing_evidence
+from sqlalchemy import select
 
 
 def context_for(incident_id, *, tenant_id="tenant-a") -> Context:
@@ -132,9 +134,17 @@ async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_
                 tenant_id="tenant-b", incident_id=incident_id, requirement_id=requirement.requirement_id,
                 response={"response": "yes", "responder_id": "owner-a", "responded_at": datetime.now(UTC).isoformat()},
             )
+        with pytest.raises(PermissionError, match="assigned HITL"):
+            await repo.record_human_evidence_response(
+                tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,
+                response={"response": "yes", "responder_id": "owner-a", "responded_at": datetime.now(UTC).isoformat()},
+            )
         recorded = await repo.record_human_evidence_response(
             tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,
-            response={"response": "yes", "responder_id": "owner-a", "responded_at": datetime.now(UTC).isoformat()},
+            response={
+                "response": "yes", "responder_id": "checkout-product-owner",
+                "responded_at": datetime.now(UTC).isoformat(),
+            },
         )
         assert recorded["evidence_id"].startswith("HUMAN-")
         gaps = await repo.list_context_evidence_requirements(
@@ -142,6 +152,29 @@ async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_
         )
         assert gaps[0]["status"] == "answered"
         assert gaps[0]["evidence_ids"] == [recorded["evidence_id"]]
+        with pytest.raises(ValueError, match="explicit correction"):
+            await repo.record_human_evidence_response(
+                tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,
+                response={
+                    "response": "corrected", "responder_id": "checkout-product-owner",
+                    "responded_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        corrected = await repo.record_human_evidence_response(
+            tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,
+            response={
+                "response": "corrected", "responder_id": "checkout-product-owner",
+                "responded_at": datetime.now(UTC).isoformat(), "correction": True,
+            },
+        )
+        assert corrected["response_version"] == 2
+        rows = (await session.execute(
+            select(HumanEvidenceResponseVersionRecord).order_by(
+                HumanEvidenceResponseVersionRecord.response_version
+            )
+        )).scalars().all()
+        assert [row.response_text for row in rows] == ["yes", "corrected"]
+        assert rows[1].supersedes_response_id == rows[0].response_id
 
 
 def test_hitl_routing_configuration_rejects_placeholder_identity():

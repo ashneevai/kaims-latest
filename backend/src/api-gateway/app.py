@@ -3830,17 +3830,37 @@ async def get_incident_context_gaps(
 
 @app.post("/incidents/{incident_id}/context-gaps/{requirement_id}/responses")
 async def post_incident_context_gap_response(
-    incident_id: str,
-    requirement_id: str,
+    incident_id: UUID,
+    requirement_id: UUID,
     request: Request,
     payload: dict[str, Any] = REQUEST_BODY,
     x_trace_id: str | None = Header(default=None),
-    tenant_id: str = Depends(current_tenant_id),
+    auth: AuthContext = Depends(require_roles(  # noqa: B008
+        SystemRole.ADMINISTRATOR.value,
+        SystemRole.L2_ENGINEER.value,
+        SystemRole.L3_ENGINEER.value,
+    )),
 ) -> dict[str, Any]:
+    responder_id = auth.email or auth.username or str(auth.user_id)
+    governed_payload = {
+        "response": str(payload.get("response") or "").strip(),
+        "source_reference": payload.get("source_reference"),
+        "responder_id": responder_id,
+        "responder_display": " ".join(
+            part for part in (auth.first_name, auth.last_name) if part
+        ) or responder_id,
+        "responded_at": datetime.now(UTC).isoformat(),
+        "correction": bool(payload.get("correction", False)),
+    }
     return await guarded_proxy(
         request=request, method="POST",
-        path=f"/incidents/{incident_id}/context-gaps/{requirement_id}/responses",
-        target_base=settings.context_agent_url, payload=payload, params={"tenant_id": tenant_id},
+        path=(
+            f"/incidents/{quote(str(incident_id), safe='')}/context-gaps/"
+            f"{quote(str(requirement_id), safe='')}/responses"
+        ),
+        target_base=settings.context_agent_url,
+        payload=governed_payload,
+        params={"tenant_id": auth.tenant_id},
         trace_id=trace_id_from_header(x_trace_id), timeout_seconds=30.0,
     )
 

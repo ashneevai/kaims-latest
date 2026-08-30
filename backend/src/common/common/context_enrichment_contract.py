@@ -120,5 +120,7 @@ class HumanEvidenceResponse(BaseModel):
 
     response: str = Field(min_length=1, max_length=10000)
     responder_id: str = Field(min_length=1, max_length=255)
+    responder_display: str | None = Field(default=None, max_length=255)
     source_reference: str | None = Field(default=None, max_length=1536)
     responded_at: datetime
+    correction: bool = False

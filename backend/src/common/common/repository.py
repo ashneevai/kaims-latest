@@ -45,6 +45,7 @@ from common.database import (
     IncidentRecord,
     JiraTicketLinkRecord,
     HumanEvidenceRequestRecord,
+    HumanEvidenceResponseVersionRecord,
     JiraIncidentBindingRecord,
     JiraSyncCursorRecord,
     KnowledgeRagDraftRecord,
@@ -81,6 +82,7 @@ from common.orchestration.execution_plan_contract import ExecutionPlanV2
 from common.orchestration.resolution_selection_contract import ResolutionSelectionV1
 from common.resolution_lifecycle import select_current_lifecycle
 from common.tenant_identity import require_tenant_id
+from common.topics import ALERT_RCA_REQUESTED_EVENT
 
 
 class ObjectStorageRepository:
@@ -8305,22 +8307,238 @@ class ContextEnrichmentRepository(EvaluationRepository):
             HumanEvidenceRequestRecord.tenant_id == tenant,
             HumanEvidenceRequestRecord.incident_id == incident_uuid,
             HumanEvidenceRequestRecord.requirement_id == requirement_uuid,
-        ))).scalar_one_or_none()
+        ).with_for_update())).scalar_one_or_none()
         if request is None:
             raise LookupError("human evidence request not found")
         responder = self._require("responder_id", response.get("responder_id"))
-        response_identity = (
-            f"{tenant}:{requirement_uuid}:{responder}:{response.get('responded_at')}"
-        )
+        if request.status in {"expired", "cancelled"}:
+            raise ValueError(f"human evidence request is {request.status}")
+        due_at = request.due_at
+        if due_at and due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=UTC)
+        if due_at and due_at < utc_now():
+            request.status = "expired"
+            raise ValueError("human evidence request is expired")
+        if responder.casefold() != str(request.expected_responder or "").strip().casefold():
+            raise PermissionError("responder is not the assigned HITL resource")
+        correction = bool(response.get("correction"))
+        previous = (await self.session.execute(
+            select(HumanEvidenceResponseVersionRecord).where(
+                HumanEvidenceResponseVersionRecord.tenant_id == tenant,
+                HumanEvidenceResponseVersionRecord.request_id == request.request_id,
+            ).order_by(HumanEvidenceResponseVersionRecord.response_version.desc()).limit(1)
+        )).scalar_one_or_none()
+        if previous is not None and not correction:
+            raise ValueError("request is already answered; submit an explicit correction")
+        requirement = (await self.session.execute(select(ContextEvidenceRequirementRecord).where(
+            ContextEvidenceRequirementRecord.requirement_id == requirement_uuid,
+            ContextEvidenceRequirementRecord.tenant_id == tenant,
+            ContextEvidenceRequirementRecord.incident_id == incident_uuid,
+        ).with_for_update())).scalar_one_or_none()
+        if requirement is None:
+            raise LookupError("evidence requirement not found")
+        if requirement.status in {"cancelled", "expired"}:
+            raise ValueError(f"evidence requirement is {requirement.status}")
+        current_binding = (await self.session.execute(
+            select(IncidentInvestigationBindingRecord).where(
+                IncidentInvestigationBindingRecord.tenant_id == tenant,
+                IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+                IncidentInvestigationBindingRecord.status == "current",
+            ).order_by(IncidentInvestigationBindingRecord.rca_version.desc()).limit(1)
+        )).scalar_one_or_none()
+        if current_binding is not None and int(current_binding.rca_version) != int(requirement.rca_version):
+            raise ValueError("human evidence request is bound to a stale RCA version")
+
+        response_text = self._require("response", response.get("response"))
+        received_at = response.get("responded_at") or utc_now()
+        if isinstance(received_at, str):
+            received_at = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+        checksum = f"sha256:{hashlib.sha256(response_text.encode()).hexdigest()}"
+        response_version = int(previous.response_version if previous else 0) + 1
+        response_identity = f"{tenant}:{request.request_id}:{response_version}:{checksum}"
         evidence_id = f"HUMAN-{uuid5(NAMESPACE_URL, response_identity)}"
-        request.response_payload = {**dict(response), "source_type": "human_assertion", "evidence_id": evidence_id}
+        response_row = HumanEvidenceResponseVersionRecord(
+            tenant_id=tenant,
+            incident_id=incident_uuid,
+            requirement_id=requirement_uuid,
+            request_id=request.request_id,
+            response_version=response_version,
+            responder_id=responder,
+            responder_display=str(response.get("responder_display") or responder),
+            source_type="human_assertion",
+            source_reference=response.get("source_reference"),
+            response_text=response_text,
+            evidence_id=evidence_id,
+            content_checksum=checksum,
+            supersedes_response_id=previous.response_id if previous else None,
+            received_at=received_at,
+        )
+        self.session.add(response_row)
+        request.response_payload = {
+            "latest_response_id": str(response_row.response_id),
+            "latest_response_version": response_version,
+            "evidence_id": evidence_id,
+        }
         request.status = "answered"
         request.version += 1
-        requirement = await self.session.get(ContextEvidenceRequirementRecord, requirement_uuid)
-        if requirement is None or requirement.tenant_id != tenant:
-            raise LookupError("evidence requirement not found")
         requirement.status = "answered"
         requirement.evidence_ids = list(dict.fromkeys([*(requirement.evidence_ids or []), evidence_id]))
         requirement.version += 1
         await self.session.flush()
-        return {"request_id": str(request.request_id), "evidence_id": evidence_id, "status": "answered"}
+        parent_snapshot_id = current_binding.context_snapshot_id if current_binding is not None else None
+        if parent_snapshot_id is None:
+            parent_snapshot_id = (await self.session.execute(
+                select(ContextSnapshotRecord.snapshot_id).where(
+                    ContextSnapshotRecord.tenant_id == tenant,
+                    ContextSnapshotRecord.incident_id == str(incident_uuid),
+                ).order_by(ContextSnapshotRecord.snapshot_version.desc()).limit(1)
+            )).scalar_one_or_none()
+        snapshot = None
+        if parent_snapshot_id is not None:
+            snapshot = await self.append_evidence_and_create_snapshot(
+                tenant_id=tenant,
+                incident_id=incident_uuid,
+                parent_snapshot_id=parent_snapshot_id,
+                requirement_id=requirement_uuid,
+                evidence_rows=[{
+                    "evidence_id": evidence_id,
+                    "source_type": "human_assertion",
+                    "source_system": "kaims_hitl",
+                    "source_reference": response.get("source_reference"),
+                    "tenant_id": tenant,
+                    "incident_id": str(incident_uuid),
+                    "observed_at": received_at.isoformat(),
+                    "collected_at": utc_now().isoformat(),
+                    "content": response_text,
+                    "content_checksum": checksum,
+                    "responder_id": responder,
+                    "response_id": str(response_row.response_id),
+                }],
+                snapshot_stage="human_response",
+            )
+            event_key = hashlib.sha256(
+                f"{tenant}:{incident_uuid}:{snapshot.snapshot_id}:{requirement_uuid}".encode()
+            ).hexdigest()
+            await self.enqueue_resolution_event(
+                event_id=f"rca-enrichment-{event_key}",
+                tenant_id=tenant,
+                aggregate_id=str(incident_uuid),
+                topic=ALERT_RCA_REQUESTED_EVENT,
+                partition_key=str(incident_uuid),
+                available_after_seconds=0,
+                payload={
+                    "tenant_id": tenant,
+                    "incident_id": str(incident_uuid),
+                    "parent_context_snapshot_id": str(parent_snapshot_id),
+                    "new_context_snapshot_id": str(snapshot.snapshot_id),
+                    "trigger": "human_response",
+                    "requirement_id": str(requirement_uuid),
+                    "evidence_ids": [evidence_id],
+                    "idempotency_key": event_key,
+                },
+            )
+        return {
+            "request_id": str(request.request_id),
+            "response_id": str(response_row.response_id),
+            "response_version": response_version,
+            "evidence_id": evidence_id,
+            "context_snapshot_id": str(snapshot.snapshot_id) if snapshot is not None else None,
+            "status": "answered",
+        }
+
+    async def append_evidence_and_create_snapshot(
+        self,
+        *,
+        tenant_id: str,
+        incident_id: UUID,
+        parent_snapshot_id: UUID,
+        requirement_id: UUID,
+        evidence_rows: list[dict[str, Any]],
+        snapshot_stage: str,
+    ) -> ContextSnapshotRecord:
+        tenant = require_tenant_id(tenant_id, source="append enrichment evidence")
+        parent = (await self.session.execute(select(ContextSnapshotRecord).where(
+            ContextSnapshotRecord.snapshot_id == parent_snapshot_id,
+            ContextSnapshotRecord.tenant_id == tenant,
+            ContextSnapshotRecord.incident_id == str(incident_id),
+        ).with_for_update())).scalar_one_or_none()
+        if parent is None:
+            raise LookupError("parent context snapshot does not match tenant and incident")
+        requirement = (await self.session.execute(select(ContextEvidenceRequirementRecord).where(
+            ContextEvidenceRequirementRecord.requirement_id == requirement_id,
+            ContextEvidenceRequirementRecord.tenant_id == tenant,
+            ContextEvidenceRequirementRecord.incident_id == incident_id,
+        ).with_for_update())).scalar_one_or_none()
+        if requirement is None:
+            raise LookupError("evidence requirement does not match tenant and incident")
+
+        existing_ids = list(parent.evidence_ids or [])
+        existing_checksums = dict(parent.evidence_checksums or {})
+        new_rows = [
+            dict(row) for row in evidence_rows
+            if str(row.get("evidence_id") or "").strip() not in set(existing_ids)
+        ]
+        payload = dict(parent.payload or {})
+        metadata = dict(payload.get("metadata") or {})
+        evidence = dict(metadata.get("context_evidence") or {})
+        human_rows = list(evidence.get("other") or [])
+        human_rows.extend(new_rows)
+        evidence["other"] = human_rows
+        metadata["context_evidence"] = evidence
+        evidence_ids = [*existing_ids, *[str(row["evidence_id"]) for row in new_rows]]
+        evidence_checksums = {
+            **existing_checksums,
+            **{
+                str(row["evidence_id"]): str(row.get("content_checksum") or "")
+                for row in new_rows
+            },
+        }
+        snapshot_id = uuid4()
+        version = int(parent.snapshot_version or 1) + 1
+        metadata.update({
+            "context_snapshot_id": str(snapshot_id),
+            "snapshot_stage": snapshot_stage,
+            "snapshot_version": version,
+        })
+        canonical = {**payload, "metadata": metadata}
+        fingerprint = hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, default=str, separators=(",", ":")).encode()
+        ).hexdigest()
+        metadata["context_fingerprint"] = fingerprint
+        row = ContextSnapshotRecord(
+            snapshot_id=snapshot_id,
+            tenant_id=tenant,
+            incident_id=str(incident_id),
+            source_incident_id=parent.source_incident_id,
+            alert_signature=parent.alert_signature,
+            subject_fingerprint=parent.subject_fingerprint,
+            context_fingerprint=fingerprint,
+            parent_snapshot_id=parent.snapshot_id,
+            snapshot_stage=snapshot_stage,
+            snapshot_version=version,
+            evidence_ids=evidence_ids,
+            evidence_checksums=evidence_checksums,
+            contract_version=parent.contract_version,
+            quality_score=parent.quality_score,
+            reusable=False,
+            source_manifest=dict(parent.source_manifest or {}),
+            payload={**payload, "metadata": metadata},
+            collected_at=utc_now(),
+            expires_at=parent.expires_at,
+        )
+        self.session.add(row)
+        requirement.status = "answered" if snapshot_stage in {"human_response", "jira_response"} else "collected"
+        requirement.evidence_ids = list(dict.fromkeys([*(requirement.evidence_ids or []), *evidence_ids]))
+        requirement.version += 1
+        await self.session.execute(update(IncidentInvestigationBindingRecord).where(
+            IncidentInvestigationBindingRecord.tenant_id == tenant,
+            IncidentInvestigationBindingRecord.incident_id == incident_id,
+            IncidentInvestigationBindingRecord.status == "current",
+        ).values(status="superseded"))
+        await self.session.execute(update(ApprovalRecord).where(
+            ApprovalRecord.tenant_id == tenant,
+            ApprovalRecord.incident_id == incident_id,
+            ApprovalRecord.decision.in_(("pending", "approved")),
+        ).values(decision="stale"))
+        await self.session.flush()
+        return row
