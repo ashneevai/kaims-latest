@@ -8192,12 +8192,56 @@ class ContextEnrichmentRepository(EvaluationRepository):
         self, *, tenant_id: str, incident_id: UUID | str,
     ) -> list[dict[str, Any]]:
         tenant = require_tenant_id(tenant_id, source="context gaps")
+        incident_uuid = self._to_uuid(incident_id)
         result = await self.session.execute(
             select(ContextEvidenceRequirementRecord).where(
                 ContextEvidenceRequirementRecord.tenant_id == tenant,
-                ContextEvidenceRequirementRecord.incident_id == self._to_uuid(incident_id),
+                ContextEvidenceRequirementRecord.incident_id == incident_uuid,
             ).order_by(ContextEvidenceRequirementRecord.created_at.asc())
         )
+        requirements = list(result.scalars().all())
+        requirement_ids = [row.requirement_id for row in requirements]
+        if not requirement_ids:
+            return []
+        jobs = list((await self.session.execute(select(ContextEnrichmentJobRecord).where(
+            ContextEnrichmentJobRecord.tenant_id == tenant,
+            ContextEnrichmentJobRecord.incident_id == incident_uuid,
+            ContextEnrichmentJobRecord.requirement_id.in_(requirement_ids),
+        ).order_by(ContextEnrichmentJobRecord.created_at.asc()))).scalars().all())
+        requests = list((await self.session.execute(select(HumanEvidenceRequestRecord).where(
+            HumanEvidenceRequestRecord.tenant_id == tenant,
+            HumanEvidenceRequestRecord.incident_id == incident_uuid,
+            HumanEvidenceRequestRecord.requirement_id.in_(requirement_ids),
+        ))).scalars().all())
+        bindings = list((await self.session.execute(select(JiraIncidentBindingRecord).where(
+            JiraIncidentBindingRecord.tenant_id == tenant,
+            JiraIncidentBindingRecord.incident_id == incident_uuid,
+            JiraIncidentBindingRecord.hitl_request_id.in_([row.request_id for row in requests]),
+        ))).scalars().all()) if requests else []
+        responses = list((await self.session.execute(select(HumanEvidenceResponseVersionRecord).where(
+            HumanEvidenceResponseVersionRecord.tenant_id == tenant,
+            HumanEvidenceResponseVersionRecord.incident_id == incident_uuid,
+            HumanEvidenceResponseVersionRecord.requirement_id.in_(requirement_ids),
+        ).order_by(
+            HumanEvidenceResponseVersionRecord.requirement_id,
+            HumanEvidenceResponseVersionRecord.response_version,
+        ))).scalars().all())
+        integrations = {
+            row.id: row for row in (await self.session.execute(select(MonitoringIntegrationRecord).where(
+                MonitoringIntegrationRecord.tenant_id == tenant,
+                MonitoringIntegrationRecord.id.in_([
+                    row.jira_connection_id for row in bindings if row.jira_connection_id is not None
+                ]),
+            ))).scalars().all()
+        } if bindings else {}
+        jobs_by_requirement: dict[UUID, list[ContextEnrichmentJobRecord]] = {}
+        for row in jobs:
+            jobs_by_requirement.setdefault(row.requirement_id, []).append(row)
+        request_by_requirement = {row.requirement_id: row for row in requests}
+        binding_by_request = {row.hitl_request_id: row for row in bindings}
+        responses_by_requirement: dict[UUID, list[HumanEvidenceResponseVersionRecord]] = {}
+        for row in responses:
+            responses_by_requirement.setdefault(row.requirement_id, []).append(row)
         return [{
             "requirement_id": str(row.requirement_id), "tenant_id": row.tenant_id,
             "incident_id": str(row.incident_id), "rca_version": row.rca_version,
@@ -8208,7 +8252,54 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "assigned_to": row.assigned_to, "jira_issue_key": row.jira_issue_key,
             "evidence_ids": list(row.evidence_ids or []), "version": row.version,
             "created_at": row.created_at, "updated_at": row.updated_at,
-        } for row in result.scalars().all()]
+            "jobs": [{
+                "job_id": str(job.job_id), "connector_id": job.connector_id,
+                "status": job.status, "attempt_count": job.attempt_count,
+                "available_at": job.available_at, "last_error": job.last_error,
+                "updated_at": job.updated_at,
+            } for job in jobs_by_requirement.get(row.requirement_id, [])],
+            "human_request": self._context_gap_request_payload(
+                request_by_requirement.get(row.requirement_id), binding_by_request, integrations
+            ),
+            "response_history": [{
+                "response_id": str(response.response_id),
+                "response_version": response.response_version,
+                "responder_display": response.responder_display,
+                "source_type": response.source_type,
+                "source_reference": response.source_reference,
+                "response_text": response.response_text,
+                "evidence_id": response.evidence_id,
+                "received_at": response.received_at,
+            } for response in responses_by_requirement.get(row.requirement_id, [])],
+        } for row in requirements]
+
+    @staticmethod
+    def _context_gap_request_payload(
+        request: HumanEvidenceRequestRecord | None,
+        bindings: dict[UUID | None, JiraIncidentBindingRecord],
+        integrations: dict[UUID, MonitoringIntegrationRecord],
+    ) -> dict[str, Any] | None:
+        if request is None:
+            return None
+        binding = bindings.get(request.request_id)
+        integration = integrations.get(binding.jira_connection_id) if binding else None
+        base_url = str(integration.endpoint_url or "").rstrip("/") if integration else ""
+        return {
+            "request_id": str(request.request_id), "status": request.status,
+            "expected_responder": request.expected_responder, "due_at": request.due_at,
+            "acceptable_format": request.acceptable_format,
+            "investigation_can_continue": request.investigation_can_continue,
+            "evidence_already_checked": list(request.evidence_already_checked or []),
+            "hypothesis_impact": request.hypothesis_impact, "version": request.version,
+            "jira_issue_key": binding.jira_issue_key if binding else None,
+            "jira_status": binding.jira_status if binding else None,
+            "jira_url": (
+                f"{base_url}/browse/{binding.jira_issue_key}" if binding and base_url else None
+            ),
+            "ownership": binding.ownership if binding else None,
+            "closure_authority": binding.closure_authority if binding else None,
+            "binding_rca_version": binding.rca_version if binding else None,
+        }
 
     async def schedule_context_enrichment_job(
         self, *, tenant_id: str, incident_id: UUID | str, requirement_id: UUID | str,

@@ -190,6 +190,10 @@ async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_
         )
         assert gaps[0]["status"] == "answered"
         assert gaps[0]["evidence_ids"] == [recorded["evidence_id"]]
+        assert gaps[0]["human_request"]["status"] == "answered"
+        assert gaps[0]["human_request"]["expected_responder"] == "checkout-product-owner"
+        assert gaps[0]["response_history"][0]["response_text"] == "yes"
+        assert gaps[0]["response_history"][0]["evidence_id"] == recorded["evidence_id"]
         with pytest.raises(ValueError, match="explicit correction"):
             await repo.record_human_evidence_response(
                 tenant_id="tenant-a", incident_id=incident_id, requirement_id=requirement.requirement_id,

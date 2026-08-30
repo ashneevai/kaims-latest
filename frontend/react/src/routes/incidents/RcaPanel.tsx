@@ -13,6 +13,7 @@ import {
 import { useRouteRuntimeSlice } from "../../app/routeRuntime";
 import EvidenceDraftReview from "./EvidenceDraftReview";
 import DecisionReadinessPanel from "./DecisionReadinessPanel";
+import ContextGapPanel from "../../features/incidents/context-gaps/ContextGapPanel";
 import "./RcaPanel.css";
 import "./RcaReuseBanner.css";
 import "./EvidenceReview.css";
@@ -119,7 +120,7 @@ export default function RcaPanel({
   onRerunRca, onRefreshSelectedAlert, onDownloadRagDocument, onLoadRagDocumentContent,
   onSubmitAiRecommendationFeedback,
 }: RcaPanelProps) {
-  const { accessToken } = useRouteRuntimeSlice("session");
+  const { accessToken, username, roleName } = useRouteRuntimeSlice("session");
   const integrityStatus = String(selectedAiTrust?.integrity?.status || "").trim().toLowerCase();
   const requiresFreshRecovery = selectedAiTrust?.contractValid !== true
     || ["context_expired", "missing_snapshot_reference", "snapshot_not_found"].includes(integrityStatus);
@@ -314,6 +315,16 @@ export default function RcaPanel({
       {analysisReused ? <aside className="rca-reuse-banner" role="status"><CheckCircle2 size={18} /><div><strong>Verified analysis reused</strong><span>Scope and freshness checks passed at {formatQualityPercent(analysisReuseScore)} similarity. Refresh if the deployment or symptoms changed.</span></div></aside> : null}
 
       <DecisionReadinessPanel title="Investigation readiness" checks={investigationChecks} eligibleLabel="Evidence ready for operator review" onReviewEvidence={() => onSetRcaDetailView("evidence")} />
+
+      <ContextGapPanel
+        incidentId={String(resolutionBinding.incident_id || "")}
+        accessToken={accessToken}
+        username={username}
+        roleName={roleName}
+        currentRcaVersion={Number(resolutionBinding.rca_version || 0)}
+        refreshKey={`${resolutionBinding.context_snapshot_id}:${selectedAlertRegeneration?.message || ""}`}
+        onEvidenceChanged={onRefreshSelectedAlert}
+      />
 
       <div className="context-workspace-toolbar">
         <nav className="rca-view-tabs" aria-label="Context workspace views" role="tablist">

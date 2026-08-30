@@ -10132,7 +10132,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           </section> : null}
 
           <RouteRuntimeProvider value={{
-            session: { accessToken: String(adminSession.accessToken || ""), username: String(adminSession?.user?.username || "operator") },
+            session: { accessToken: String(adminSession.accessToken || ""), username: String(adminSession?.user?.username || "operator"), roleName: String(adminSession?.user?.role_name || "") },
             dashboard: {
               role: roleDashboard,
               allowedTabs,
