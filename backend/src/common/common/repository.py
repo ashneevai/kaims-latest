@@ -8542,3 +8542,88 @@ class ContextEnrichmentRepository(EvaluationRepository):
         ).values(decision="stale"))
         await self.session.flush()
         return row
+
+    async def claim_context_enrichment_jobs(
+        self,
+        *,
+        worker_id: str,
+        limit: int,
+        lease_seconds: int,
+    ) -> list[ContextEnrichmentJobRecord]:
+        owner = self._require("context_enrichment.worker_id", worker_id)
+        now = utc_now()
+        rows = list((await self.session.execute(
+            select(ContextEnrichmentJobRecord).where(
+                ContextEnrichmentJobRecord.status.in_(("scheduled", "retry")),
+                ContextEnrichmentJobRecord.available_at <= now,
+                or_(
+                    ContextEnrichmentJobRecord.lease_expires_at.is_(None),
+                    ContextEnrichmentJobRecord.lease_expires_at < now,
+                ),
+            ).order_by(
+                ContextEnrichmentJobRecord.available_at,
+                ContextEnrichmentJobRecord.created_at,
+            ).limit(max(1, min(int(limit), 100))).with_for_update(skip_locked=True)
+        )).scalars().all())
+        expires_at = now + timedelta(seconds=max(1, int(lease_seconds)))
+        for row in rows:
+            row.status = "collecting"
+            row.lease_owner = owner
+            row.lease_expires_at = expires_at
+            row.attempt_count += 1
+        await self.session.flush()
+        return rows
+
+    async def complete_context_enrichment_job(
+        self, *, job_id: UUID | str, worker_id: str, evidence_ids: list[str],
+    ) -> None:
+        row = await self._locked_enrichment_job(job_id=job_id, worker_id=worker_id)
+        row.status = "collected"
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.last_error = None
+        requirement = await self.session.get(ContextEvidenceRequirementRecord, row.requirement_id)
+        if requirement is not None and requirement.tenant_id == row.tenant_id:
+            requirement.status = "collected"
+            requirement.evidence_ids = list(dict.fromkeys([*(requirement.evidence_ids or []), *evidence_ids]))
+            requirement.version += 1
+        await self.session.flush()
+
+    async def retry_context_enrichment_job(
+        self, *, job_id: UUID | str, worker_id: str, error: str, retry_after_seconds: int,
+    ) -> None:
+        row = await self._locked_enrichment_job(job_id=job_id, worker_id=worker_id)
+        row.status = "retry"
+        row.available_at = utc_now() + timedelta(seconds=max(1, int(retry_after_seconds)))
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.last_error = str(error or "collection failed")[:4000]
+        await self.session.flush()
+
+    async def fail_context_enrichment_job(
+        self, *, job_id: UUID | str, worker_id: str, error: str,
+    ) -> ContextEnrichmentJobRecord:
+        row = await self._locked_enrichment_job(job_id=job_id, worker_id=worker_id)
+        row.status = "blocked"
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.last_error = str(error or "collection blocked")[:4000]
+        requirement = await self.session.get(ContextEvidenceRequirementRecord, row.requirement_id)
+        if requirement is not None and requirement.tenant_id == row.tenant_id:
+            requirement.status = "blocked"
+            requirement.retry_count = row.attempt_count
+            requirement.version += 1
+        await self.session.flush()
+        return row
+
+    async def _locked_enrichment_job(
+        self, *, job_id: UUID | str, worker_id: str,
+    ) -> ContextEnrichmentJobRecord:
+        row = (await self.session.execute(select(ContextEnrichmentJobRecord).where(
+            ContextEnrichmentJobRecord.job_id == self._to_uuid(job_id),
+        ).with_for_update())).scalar_one_or_none()
+        if row is None:
+            raise LookupError("context enrichment job not found")
+        if row.status != "collecting" or row.lease_owner != worker_id:
+            raise RuntimeError("context enrichment job lease is not owned by this worker")
+        return row

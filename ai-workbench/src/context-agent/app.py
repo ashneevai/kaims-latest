@@ -37,7 +37,7 @@ from common.telemetry import (
     EVENTS_PROCESSED,
 )
 from common.tenant_identity import require_tenant_id
-from common.topics import CONTEXT_EVENTS, ORCHESTRATION_EVENTS
+from common.topics import ALERT_RCA_REQUESTED_EVENT, CONTEXT_EVENTS, ORCHESTRATION_EVENTS
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import VectorDBConnector
 from context_agent.context_quality import (
@@ -936,6 +936,129 @@ async def _governed_rag_retry_loop(app: FastAPI) -> None:
         await asyncio.sleep(max(5.0, float(getattr(settings, "rag_index_retry_seconds", 30.0) or 30.0)))
 
 
+async def _context_enrichment_worker_loop(app: FastAPI) -> None:
+    worker_id = f"context-agent:{os.getpid()}"
+    retry_backoff = (15, 60, 300)
+    while True:
+        try:
+            async with app.state.session_factory() as session:
+                repo = ContextEnrichmentRepository(session)
+                claimed = await repo.claim_context_enrichment_jobs(
+                    worker_id=worker_id, limit=10, lease_seconds=120,
+                )
+                jobs = [{
+                    "job_id": row.job_id,
+                    "tenant_id": row.tenant_id,
+                    "incident_id": row.incident_id,
+                    "requirement_id": row.requirement_id,
+                    "connector_id": row.connector_id,
+                    "attempt_count": row.attempt_count,
+                    "query_payload": dict(row.query_payload or {}),
+                } for row in claimed]
+                await session.commit()
+            for job in jobs:
+                try:
+                    tool_payload = {
+                        "alert": job["query_payload"].get("alert"),
+                        "incident": job["query_payload"].get("incident"),
+                    }
+                    result = await agent.tool_registry.execute(
+                        f"connector.{job['connector_id']}", tool_payload, role="context-agent",
+                    )
+                    if not isinstance(result, dict) or not result or result.get("error"):
+                        raise RuntimeError(str((result or {}).get("error") or "connector returned no evidence"))
+                    collected_at = datetime.now(UTC)
+                    serialized_result = json.dumps(
+                        result, sort_keys=True, default=str, separators=(",", ":"),
+                    )
+                    content_checksum = f"sha256:{hashlib.sha256(serialized_result.encode()).hexdigest()}"
+                    evidence_id = f"AUTO-{content_checksum.removeprefix('sha256:')[:32]}"
+                    evidence = {
+                        "evidence_id": evidence_id,
+                        "source_type": job["connector_id"],
+                        "source_system": job["connector_id"],
+                        "connector_id": job["connector_id"],
+                        "source_reference": result.get("source_reference"),
+                        "tenant_id": job["tenant_id"],
+                        "incident_id": str(job["incident_id"]),
+                        "service": job["query_payload"].get("service"),
+                        "environment": job["query_payload"].get("environment"),
+                        "observation_start": job["query_payload"].get("observation_start"),
+                        "observation_end": job["query_payload"].get("observation_end"),
+                        "collected_at": collected_at.isoformat(),
+                        "freshness_status": "fresh",
+                        "content_checksum": content_checksum,
+                        "content": result,
+                        "provenance": result.get("provenance") or {},
+                    }
+                    async with app.state.session_factory() as session:
+                        repo = ContextEnrichmentRepository(session)
+                        snapshot = await repo.append_evidence_and_create_snapshot(
+                            tenant_id=job["tenant_id"],
+                            incident_id=job["incident_id"],
+                            parent_snapshot_id=UUID(job["query_payload"]["context_snapshot_id"]),
+                            requirement_id=job["requirement_id"],
+                            evidence_rows=[evidence],
+                            snapshot_stage="automatic_enrichment",
+                        )
+                        await repo.complete_context_enrichment_job(
+                            job_id=job["job_id"], worker_id=worker_id, evidence_ids=[evidence_id],
+                        )
+                        event_key = hashlib.sha256(
+                            f"{job['tenant_id']}:{job['incident_id']}:{snapshot.snapshot_id}".encode()
+                        ).hexdigest()
+                        await repo.enqueue_resolution_event(
+                            event_id=f"rca-enrichment-{event_key}",
+                            tenant_id=job["tenant_id"],
+                            aggregate_id=str(job["incident_id"]),
+                            topic=ALERT_RCA_REQUESTED_EVENT,
+                            partition_key=str(job["incident_id"]),
+                            available_after_seconds=0,
+                            payload={
+                                "tenant_id": job["tenant_id"],
+                                "incident_id": str(job["incident_id"]),
+                                "parent_context_snapshot_id": job["query_payload"]["context_snapshot_id"],
+                                "new_context_snapshot_id": str(snapshot.snapshot_id),
+                                "trigger": "automatic_enrichment",
+                                "requirement_id": str(job["requirement_id"]),
+                                "evidence_ids": [evidence_id],
+                                "idempotency_key": event_key,
+                            },
+                        )
+                        await session.commit()
+                except Exception as exc:
+                    async with app.state.session_factory() as session:
+                        repo = ContextEnrichmentRepository(session)
+                        if int(job["attempt_count"]) < 4:
+                            delay = retry_backoff[min(int(job["attempt_count"]) - 1, len(retry_backoff) - 1)]
+                            await repo.retry_context_enrichment_job(
+                                job_id=job["job_id"], worker_id=worker_id,
+                                error=str(exc), retry_after_seconds=delay,
+                            )
+                        else:
+                            failed = await repo.fail_context_enrichment_job(
+                                job_id=job["job_id"], worker_id=worker_id, error=str(exc),
+                            )
+                            expected = str(job["query_payload"].get("expected_responder") or "").strip()
+                            if expected:
+                                await repo.create_human_evidence_request(
+                                    tenant_id=job["tenant_id"], incident_id=job["incident_id"],
+                                    requirement_id=failed.requirement_id, expected_responder=expected,
+                                    due_at=datetime.now(UTC) + timedelta(hours=1),
+                                    acceptable_format="Answer with an authoritative source reference",
+                                    evidence_already_checked=[job["connector_id"]],
+                                    hypothesis_impact="Automatic evidence collection exhausted its retry budget",
+                                    investigation_can_continue=True,
+                                )
+                        await session.commit()
+                    logger.warning("context enrichment job failed", extra={"job_id": str(job["job_id"])})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("context enrichment worker scan failed")
+        await asyncio.sleep(2.0)
+
+
 async def startup(app: FastAPI) -> None:
     provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq").strip().lower()
     app.state.message_bus_publishers = {provider: app.state.producer, "rabbitmq": app.state.producer}
@@ -963,6 +1086,9 @@ async def startup(app: FastAPI) -> None:
         name="context-agent-governed-rag-indexer",
     ))
     tasks.append(asyncio.create_task(_governed_rag_retry_loop(app), name="context-agent-rag-index-retries"))
+    tasks.append(asyncio.create_task(
+        _context_enrichment_worker_loop(app), name="context-agent-enrichment-worker",
+    ))
 
     async def handle(payload: dict) -> None:
         alert = Alert.model_validate(payload["alert"])

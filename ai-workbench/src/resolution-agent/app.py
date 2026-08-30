@@ -386,9 +386,23 @@ async def persist_investigation_enrichment_plan(
                         query_payload={
                             "service": context.alert.service,
                             "environment": context.alert.environment,
+                            "alert": context.alert.model_dump(mode="json"),
+                            "incident": {
+                                "id": str(context.incident_id),
+                                "service": context.alert.service,
+                                "severity": context.alert.severity,
+                                "title": f"{context.alert.service}: {context.alert.name}",
+                            },
                             "context_snapshot_id": str(final_snapshot.snapshot_id),
                             "observation_window_version": str(final_snapshot.snapshot_id),
+                            "observation_start": observation_start.isoformat(),
+                            "observation_end": collected_at.isoformat(),
                             "rca_version": max(1, rca_version),
+                            "expected_responder": str(
+                                metadata.get("service_owner")
+                                or metadata.get("fallback_assignment_group")
+                                or ""
+                            ),
                         },
                         observation_start=observation_start,
                         observation_end=collected_at,

@@ -112,6 +112,44 @@ async def test_connector_unavailable_becomes_human_request_without_stopping_othe
 
 
 @pytest.mark.asyncio
+async def test_enrichment_job_leases_are_exclusive_reclaimable_and_retry_with_backoff(
+    sqlite_session_factory,
+):
+    incident_id = uuid4()
+    requirements = await plan_missing_evidence(
+        context_for(incident_id),
+        {
+            "tenant_id": "tenant-a", "incident_id": str(incident_id), "rca_version": 1,
+            "missing_evidence": ["logs"],
+        },
+    )
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements(requirements)
+        now = datetime.now(UTC)
+        job = await repo.schedule_context_enrichment_job(
+            tenant_id="tenant-a", incident_id=incident_id,
+            requirement_id=requirements[0].requirement_id, connector_id="opensearch",
+            query_payload={"rca_version": 1, "observation_window_version": "snapshot-1"},
+            observation_start=now - timedelta(minutes=10), observation_end=now,
+        )
+        claimed = await repo.claim_context_enrichment_jobs(worker_id="worker-a", limit=10, lease_seconds=30)
+        assert [row.job_id for row in claimed] == [job.job_id]
+        assert await repo.claim_context_enrichment_jobs(worker_id="worker-b", limit=10, lease_seconds=30) == []
+
+        job.status = "retry"
+        job.available_at = now - timedelta(seconds=1)
+        job.lease_expires_at = now - timedelta(seconds=1)
+        reclaimed = await repo.claim_context_enrichment_jobs(worker_id="worker-b", limit=10, lease_seconds=30)
+        assert [row.job_id for row in reclaimed] == [job.job_id]
+        await repo.retry_context_enrichment_job(
+            job_id=job.job_id, worker_id="worker-b", error="temporary outage", retry_after_seconds=60,
+        )
+        retry_at = job.available_at.replace(tzinfo=UTC) if job.available_at.tzinfo is None else job.available_at
+        assert retry_at >= datetime.now(UTC) + timedelta(seconds=55)
+
+
+@pytest.mark.asyncio
 async def test_human_response_is_tenant_scoped_and_recorded_as_assertion(sqlite_session_factory):
     incident_id = uuid4()
     requirement = EvidenceRequirement(
