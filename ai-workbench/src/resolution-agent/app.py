@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable, Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -12,6 +12,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 import httpx
 from ai_workbench_common.models import Context
 from common.config import get_settings
+from common.context_enrichment import plan_missing_evidence
 from common.event_publishers import build_agent_event_contract, build_event_envelope
 from common.resolution_lifecycle import ResolutionState, create_lifecycle, decide_resolution_control
 from common.kafka import KafkaConsumer
@@ -30,7 +31,7 @@ from common.orchestration.execution_plan_contract import (
 )
 from common.rabbitmq import RabbitMQConsumer
 from common.rabbitmq import consume_forever as consume_rabbitmq_forever
-from common.repository import IncidentRepository
+from common.repository import ContextEnrichmentRepository, IncidentRepository
 from common.service import create_app
 from common.telemetry import CONTEXT_KNOWLEDGE_OPERATIONS, EVENTS_PROCESSED
 from common.tenant_identity import require_tenant_id
@@ -336,6 +337,91 @@ async def persist_final_investigation_snapshot(
         )
         await session.commit()
         return row
+
+
+async def persist_investigation_enrichment_plan(
+    *,
+    context: Context,
+    investigation_report: dict[str, Any],
+    final_snapshot: Any,
+    rca_version: int,
+) -> dict[str, Any]:
+    """Atomically persist the collection work declared by an investigation."""
+    report = dict(investigation_report)
+    if not report.get("missing_evidence"):
+        report["missing_evidence"] = report.get("missing_sources") or report.get("next_evidence") or []
+    requirements = plan_missing_evidence(
+        tenant_id=context.tenant_id,
+        incident_id=context.incident_id,
+        rca_version=max(1, rca_version),
+        investigation_report=report,
+        context=context,
+        now=datetime.now(UTC),
+    )
+    if not requirements:
+        return {"requirement_ids": [], "job_ids": [], "human_request_ids": []}
+
+    metadata = context.metadata if isinstance(context.metadata, dict) else {}
+    authorized = {
+        str(value).strip()
+        for value in metadata.get("authorized_connectors", [])
+        if str(value).strip()
+    }
+    collected_at = _utc_aware(getattr(final_snapshot, "collected_at", datetime.now(UTC)))
+    observation_start = collected_at - timedelta(minutes=10)
+    job_ids: list[str] = []
+    request_ids: list[str] = []
+    async with app.state.session_factory() as session:
+        repository = ContextEnrichmentRepository(session)
+        persisted = await repository.upsert_context_evidence_requirements(requirements)
+        for requirement, persisted_requirement in zip(requirements, persisted, strict=True):
+            available = [value for value in requirement.candidate_connectors if value in authorized]
+            if requirement.collection_mode == "automatic" and available:
+                for connector_id in available:
+                    job = await repository.schedule_context_enrichment_job(
+                        tenant_id=context.tenant_id,
+                        incident_id=context.incident_id,
+                        requirement_id=persisted_requirement.requirement_id,
+                        connector_id=connector_id,
+                        query_payload={
+                            "service": context.alert.service,
+                            "environment": context.alert.environment,
+                            "context_snapshot_id": str(final_snapshot.snapshot_id),
+                            "observation_window_version": str(final_snapshot.snapshot_id),
+                            "rca_version": max(1, rca_version),
+                        },
+                        observation_start=observation_start,
+                        observation_end=collected_at,
+                    )
+                    job_ids.append(str(job.job_id))
+                continue
+            expected_responder = str(
+                metadata.get("service_owner")
+                or metadata.get("fallback_assignment_group")
+                or ""
+            ).strip()
+            if not expected_responder:
+                persisted_requirement.status = "blocked"
+                persisted_requirement.version += 1
+                continue
+            request = await repository.create_human_evidence_request(
+                tenant_id=context.tenant_id,
+                incident_id=context.incident_id,
+                requirement_id=persisted_requirement.requirement_id,
+                expected_responder=expected_responder,
+                due_at=datetime.now(UTC) + timedelta(minutes=60),
+                acceptable_format="A concise answer with an authoritative source reference",
+                evidence_already_checked=list(requirement.candidate_connectors),
+                hypothesis_impact=requirement.reason,
+                investigation_can_continue=True,
+            )
+            request_ids.append(str(request.request_id))
+        await session.commit()
+    return {
+        "requirement_ids": [str(row.requirement_id) for row in requirements],
+        "job_ids": job_ids,
+        "human_request_ids": request_ids,
+    }
 
 
 def bind_context_to_snapshot(context: Context, *, snapshot: Any) -> Context:
@@ -1183,7 +1269,17 @@ async def startup(app: FastAPI) -> None:
         final_snapshot = await persist_final_investigation_snapshot(
             investigated_context, investigation_report, initial_snapshot["snapshot_id"],
         )
+        enrichment = await persist_investigation_enrichment_plan(
+            context=investigated_context,
+            investigation_report=investigation_report,
+            final_snapshot=final_snapshot,
+            rca_version=max(
+                1,
+                int((investigated_context.metadata or {}).get("rca_version") or 1),
+            ),
+        )
         context = bind_context_to_snapshot(investigated_context, snapshot=final_snapshot)
+        context.metadata["context_enrichment"] = enrichment
         recommendation = await _resolve_context(context)
         _attach_rca_governance_binding(recommendation, context)
         _validate_recommendation_snapshot_evidence(recommendation, final_snapshot)
@@ -1642,7 +1738,14 @@ async def resolve(context: Context, publish_events: bool = True) -> Recommendati
     final_snapshot = await persist_final_investigation_snapshot(
         investigated_context, investigation_report, initial_snapshot["snapshot_id"],
     )
+    enrichment = await persist_investigation_enrichment_plan(
+        context=investigated_context,
+        investigation_report=investigation_report,
+        final_snapshot=final_snapshot,
+        rca_version=max(1, int((investigated_context.metadata or {}).get("rca_version") or 1)),
+    )
     context = bind_context_to_snapshot(investigated_context, snapshot=final_snapshot)
+    context.metadata["context_enrichment"] = enrichment
     recommendation = await _resolve_context(context)
     _attach_rca_governance_binding(recommendation, context)
     _validate_recommendation_snapshot_evidence(recommendation, final_snapshot)

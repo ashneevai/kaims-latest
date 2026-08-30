@@ -8212,10 +8212,28 @@ class ContextEnrichmentRepository(EvaluationRepository):
         observation_end: datetime,
     ) -> ContextEnrichmentJobRecord:
         tenant = require_tenant_id(tenant_id, source="context enrichment job")
+        incident_uuid = self._to_uuid(incident_id)
+        requirement_uuid = self._to_uuid(requirement_id)
+        requirement = (await self.session.execute(
+            select(ContextEvidenceRequirementRecord).where(
+                ContextEvidenceRequirementRecord.requirement_id == requirement_uuid,
+                ContextEvidenceRequirementRecord.tenant_id == tenant,
+                ContextEvidenceRequirementRecord.incident_id == incident_uuid,
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if requirement is None:
+            raise LookupError("evidence requirement does not match tenant and incident")
+        if requirement.status in {"cancelled", "expired"}:
+            raise ValueError(f"cannot schedule {requirement.status} evidence requirement")
         material = json.dumps({
-            "tenant": tenant, "incident": str(incident_id), "requirement": str(requirement_id),
-            "connector": connector_id, "query": query_payload,
-            "start": observation_start.isoformat(), "end": observation_end.isoformat(),
+            "tenant_id": tenant,
+            "incident_id": str(incident_uuid),
+            "requirement_id": str(requirement_uuid),
+            "connector_id": connector_id,
+            "rca_version": int(query_payload.get("rca_version") or requirement.rca_version),
+            "observation_window_version": str(
+                query_payload.get("observation_window_version") or requirement.rca_version
+            ),
         }, sort_keys=True, separators=(",", ":"))
         key = hashlib.sha256(material.encode()).hexdigest()
         existing = (await self.session.execute(select(ContextEnrichmentJobRecord).where(
@@ -8225,8 +8243,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
         if existing is not None:
             return existing
         row = ContextEnrichmentJobRecord(
-            tenant_id=tenant, incident_id=self._to_uuid(incident_id),
-            requirement_id=self._to_uuid(requirement_id), connector_id=self._require("connector_id", connector_id),
+            tenant_id=tenant, incident_id=incident_uuid,
+            requirement_id=requirement_uuid, connector_id=self._require("connector_id", connector_id),
             idempotency_key=key, query_payload=dict(query_payload), observation_start=observation_start,
             observation_end=observation_end, status="scheduled", attempt_count=0,
         )
@@ -8241,7 +8259,19 @@ class ContextEnrichmentRepository(EvaluationRepository):
         investigation_can_continue: bool = True,
     ) -> HumanEvidenceRequestRecord:
         tenant = require_tenant_id(tenant_id, source="human evidence request")
+        incident_uuid = self._to_uuid(incident_id)
         requirement_uuid = self._to_uuid(requirement_id)
+        requirement = (await self.session.execute(
+            select(ContextEvidenceRequirementRecord).where(
+                ContextEvidenceRequirementRecord.requirement_id == requirement_uuid,
+                ContextEvidenceRequirementRecord.tenant_id == tenant,
+                ContextEvidenceRequirementRecord.incident_id == incident_uuid,
+            ).with_for_update()
+        )).scalar_one_or_none()
+        if requirement is None:
+            raise LookupError("evidence requirement does not match tenant and incident")
+        if requirement.status in {"cancelled", "expired"}:
+            raise ValueError(f"cannot request a response for {requirement.status} evidence requirement")
         existing = (await self.session.execute(select(HumanEvidenceRequestRecord).where(
             HumanEvidenceRequestRecord.tenant_id == tenant,
             HumanEvidenceRequestRecord.requirement_id == requirement_uuid,
@@ -8249,7 +8279,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
         if existing is not None:
             return existing
         row = HumanEvidenceRequestRecord(
-            tenant_id=tenant, incident_id=self._to_uuid(incident_id), requirement_id=requirement_uuid,
+            tenant_id=tenant, incident_id=incident_uuid, requirement_id=requirement_uuid,
             expected_responder=self._require("expected_responder", expected_responder), due_at=due_at,
             acceptable_format=self._require("acceptable_format", acceptable_format),
             investigation_can_continue=investigation_can_continue,
@@ -8258,11 +8288,9 @@ class ContextEnrichmentRepository(EvaluationRepository):
             status="pending", response_payload={}, version=1,
         )
         self.session.add(row)
-        requirement = await self.session.get(ContextEvidenceRequirementRecord, requirement_uuid)
-        if requirement is not None and requirement.tenant_id == tenant:
-            requirement.status = "human_requested"
-            requirement.assigned_to = expected_responder
-            requirement.version += 1
+        requirement.status = "human_requested"
+        requirement.assigned_to = expected_responder
+        requirement.version += 1
         await self.session.flush()
         return row
 
