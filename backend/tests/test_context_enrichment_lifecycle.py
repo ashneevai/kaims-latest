@@ -4,6 +4,7 @@ from uuid import uuid4
 import pytest
 from ai_workbench_common.models import Context
 from common.context_enrichment_contract import EvidenceRequirement, HitlRoutingConfiguration
+from common.context_enrichment import plan_missing_evidence as plan_missing_evidence_shared
 from common.models import Alert, AlertSeverity
 from common.repository import ContextEnrichmentRepository
 from context_agent.connectors import execute_enrichment_plan
@@ -17,6 +18,33 @@ def context_for(incident_id, *, tenant_id="tenant-a") -> Context:
         description="p99 latency is above threshold",
     )
     return Context(tenant_id=tenant_id, incident_id=incident_id, alert=alert)
+
+
+def test_shared_planner_validates_identity_normalizes_priority_and_keeps_stable_ids():
+    incident_id = uuid4()
+    context = context_for(incident_id)
+    report = {
+        "missing_evidence": [
+            {"category": "logs", "question": " Which errors preceded the alert? ", "priority": "urgent"}
+        ]
+    }
+    kwargs = {
+        "tenant_id": "tenant-a",
+        "incident_id": incident_id,
+        "rca_version": 2,
+        "investigation_report": report,
+        "context": context,
+        "now": datetime.now(UTC),
+    }
+    first = plan_missing_evidence_shared(**kwargs)
+    second = plan_missing_evidence_shared(**kwargs)
+    assert first[0].priority == "high"
+    assert first[0].requirement_id == second[0].requirement_id
+
+    with pytest.raises(ValueError, match="tenant mismatch"):
+        plan_missing_evidence_shared(**{**kwargs, "tenant_id": "tenant-b"})
+    with pytest.raises(ValueError, match="incident mismatch"):
+        plan_missing_evidence_shared(**{**kwargs, "incident_id": uuid4()})
 
 
 @pytest.mark.asyncio
