@@ -8359,6 +8359,9 @@ class ContextEnrichmentRepository(EvaluationRepository):
         response_version = int(previous.response_version if previous else 0) + 1
         response_identity = f"{tenant}:{request.request_id}:{response_version}:{checksum}"
         evidence_id = f"HUMAN-{uuid5(NAMESPACE_URL, response_identity)}"
+        response_source_type = str(response.get("source_type") or "human_assertion").strip().lower()
+        if response_source_type not in {"human_assertion", "jira"}:
+            raise ValueError("unsupported human evidence response source")
         response_row = HumanEvidenceResponseVersionRecord(
             tenant_id=tenant,
             incident_id=incident_uuid,
@@ -8367,7 +8370,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
             response_version=response_version,
             responder_id=responder,
             responder_display=str(response.get("responder_display") or responder),
-            source_type="human_assertion",
+            source_type=response_source_type,
             source_reference=response.get("source_reference"),
             response_text=response_text,
             evidence_id=evidence_id,
@@ -8404,8 +8407,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 requirement_id=requirement_uuid,
                 evidence_rows=[{
                     "evidence_id": evidence_id,
-                    "source_type": "human_assertion",
-                    "source_system": "kaims_hitl",
+                    "source_type": response_source_type,
+                    "source_system": "jira" if response_source_type == "jira" else "kaims_hitl",
                     "source_reference": response.get("source_reference"),
                     "tenant_id": tenant,
                     "incident_id": str(incident_uuid),
@@ -8416,7 +8419,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     "responder_id": responder,
                     "response_id": str(response_row.response_id),
                 }],
-                snapshot_stage="human_response",
+                snapshot_stage="jira_response" if response_source_type == "jira" else "human_response",
             )
             event_key = hashlib.sha256(
                 f"{tenant}:{incident_uuid}:{snapshot.snapshot_id}:{requirement_uuid}".encode()
@@ -8433,7 +8436,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     "incident_id": str(incident_uuid),
                     "parent_context_snapshot_id": str(parent_snapshot_id),
                     "new_context_snapshot_id": str(snapshot.snapshot_id),
-                    "trigger": "human_response",
+                    "trigger": "jira_response" if response_source_type == "jira" else "human_response",
                     "requirement_id": str(requirement_uuid),
                     "evidence_ids": [evidence_id],
                     "idempotency_key": event_key,
@@ -8768,6 +8771,58 @@ class ContextEnrichmentRepository(EvaluationRepository):
         await self.session.flush()
         return row, True
 
+    async def mark_jira_webhook_receipt(
+        self, *, receipt_id: UUID | str, status: str, error: str | None = None,
+    ) -> None:
+        row = await self.session.get(JiraWebhookReceiptRecord, self._to_uuid(receipt_id))
+        if row is None:
+            raise LookupError("Jira webhook receipt not found")
+        row.processing_status = self._require("processing_status", status)
+        row.processing_error = str(error)[:4000] if error else None
+        row.processed_at = utc_now() if status in {"processed", "ignored", "failed"} else None
+        await self.session.flush()
+
+    async def jira_sync_cursor(
+        self, *, tenant_id: str, jira_connection_id: UUID | str, project_key: str,
+    ) -> JiraSyncCursorRecord | None:
+        return (await self.session.execute(select(JiraSyncCursorRecord).where(
+            JiraSyncCursorRecord.tenant_id == require_tenant_id(
+                tenant_id, source="Jira sync cursor"
+            ),
+            JiraSyncCursorRecord.jira_connection_id == self._to_uuid(jira_connection_id),
+            JiraSyncCursorRecord.jira_project_key == self._require("project_key", project_key),
+        ))).scalar_one_or_none()
+
+    async def save_jira_sync_cursor(
+        self, *, tenant_id: str, jira_connection_id: UUID | str, project_key: str,
+        jira_updated_at: datetime | None, issue_key: str | None,
+        status: str = "succeeded", error: str | None = None,
+    ) -> JiraSyncCursorRecord:
+        tenant = require_tenant_id(tenant_id, source="Jira sync cursor")
+        connection_id = self._to_uuid(jira_connection_id)
+        project = self._require("project_key", project_key)
+        row = (await self.session.execute(select(JiraSyncCursorRecord).where(
+            JiraSyncCursorRecord.tenant_id == tenant,
+            JiraSyncCursorRecord.jira_connection_id == connection_id,
+            JiraSyncCursorRecord.jira_project_key == project,
+        ).with_for_update())).scalar_one_or_none()
+        if row is None:
+            row = JiraSyncCursorRecord(
+                tenant_id=tenant, jira_connection_id=connection_id,
+                jira_project_key=project, version=1,
+            )
+            self.session.add(row)
+        else:
+            row.version += 1
+        row.poll_status = status
+        row.poll_error = str(error)[:4000] if error else None
+        if status == "succeeded":
+            row.last_successful_poll_at = utc_now()
+            row.last_jira_updated_timestamp = jira_updated_at
+            row.last_issue_key = issue_key
+        await self.session.flush()
+        return row
+
     async def bind_jira_hitl_issue(
         self,
         *,
@@ -8840,3 +8895,115 @@ class ContextEnrichmentRepository(EvaluationRepository):
         ).values(response_payload={"jira_issue_key": jira_issue_key}))
         await self.session.flush()
         return row
+
+    async def resolve_jira_connection_for_project(
+        self, *, project_key: str,
+    ) -> MonitoringIntegrationRecord:
+        rows = list((await self.session.execute(select(MonitoringIntegrationRecord).where(
+            MonitoringIntegrationRecord.provider.in_(("jira", "atlassian", "jira_cloud")),
+            MonitoringIntegrationRecord.active.is_(True),
+        ))).scalars().all())
+        key = self._require("jira_project_key", project_key).casefold()
+        matches = [row for row in rows if str(
+            (row.config_payload or {}).get("jira_project_key")
+            or (row.config_payload or {}).get("project_key")
+            or row.project_name
+            or ""
+        ).strip().casefold() == key]
+        if len(matches) != 1:
+            raise LookupError("Jira project does not resolve to exactly one active connection")
+        return matches[0]
+
+    async def jira_binding_for_issue(
+        self,
+        *,
+        tenant_id: str,
+        jira_connection_id: UUID | str,
+        jira_issue_id: str | None,
+        jira_issue_key: str,
+        lock: bool = False,
+    ) -> JiraIncidentBindingRecord | None:
+        statement = select(JiraIncidentBindingRecord).where(
+            JiraIncidentBindingRecord.tenant_id == require_tenant_id(
+                tenant_id, source="Jira issue binding lookup"
+            ),
+            JiraIncidentBindingRecord.jira_connection_id == self._to_uuid(jira_connection_id),
+            or_(
+                JiraIncidentBindingRecord.jira_issue_key == jira_issue_key,
+                and_(
+                    JiraIncidentBindingRecord.jira_issue_id == jira_issue_id,
+                    JiraIncidentBindingRecord.jira_issue_id.is_not(None),
+                ),
+            ),
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return (await self.session.execute(statement)).scalar_one_or_none()
+
+    async def update_jira_binding_from_issue(
+        self,
+        *,
+        binding: JiraIncidentBindingRecord,
+        status_name: str,
+        status_id: str | None,
+        status_category: str | None,
+        assignee_account_id: str | None,
+        jira_updated_at: datetime,
+    ) -> None:
+        binding.jira_status = status_name
+        binding.jira_status_id = status_id
+        binding.jira_status_category = status_category
+        binding.jira_assignee_account_id = assignee_account_id
+        binding.jira_updated_at = jira_updated_at
+        binding.last_jira_updated_at = jira_updated_at
+        binding.last_synced_at = utc_now()
+        await self.session.flush()
+
+    async def block_jira_human_request_without_response(
+        self, *, binding: JiraIncidentBindingRecord,
+    ) -> None:
+        if binding.hitl_request_id is None:
+            return
+        request = await self.session.get(HumanEvidenceRequestRecord, binding.hitl_request_id)
+        if request is not None and request.tenant_id == binding.tenant_id:
+            request.status = "blocked"
+            request.version += 1
+            requirement = await self.session.get(ContextEvidenceRequirementRecord, request.requirement_id)
+            if requirement is not None and requirement.tenant_id == binding.tenant_id:
+                requirement.status = "blocked"
+                requirement.version += 1
+        binding.status = "blocked"
+        await self.session.flush()
+
+    async def record_jira_binding_response(
+        self,
+        *,
+        binding: JiraIncidentBindingRecord,
+        response_text: str,
+        responder_id: str,
+        responder_display: str | None,
+        source_reference: str,
+        responded_at: datetime,
+    ) -> dict[str, Any]:
+        if binding.hitl_request_id is None:
+            raise LookupError("Jira binding has no human evidence request")
+        request = await self.session.get(HumanEvidenceRequestRecord, binding.hitl_request_id)
+        if request is None or request.tenant_id != binding.tenant_id:
+            raise LookupError("bound human evidence request not found")
+        result = await self.record_human_evidence_response(
+            tenant_id=binding.tenant_id,
+            incident_id=binding.incident_id,
+            requirement_id=request.requirement_id,
+            response={
+                "response": self._require("response", response_text),
+                "responder_id": self._require("responder_id", responder_id),
+                "responder_display": responder_display or responder_id,
+                "source_reference": self._require("source_reference", source_reference),
+                "responded_at": responded_at,
+                "source_type": "jira",
+                "correction": request.status == "answered",
+            },
+        )
+        binding.status = "answered"
+        await self.session.flush()
+        return result

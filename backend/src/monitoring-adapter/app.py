@@ -69,7 +69,7 @@ from monitoring_adapter.existing_monitoring import (
     verify_hmac_signature,
 )
 from monitoring_adapter.jira_admission import JiraAdmissionState
-from monitoring_adapter.jira_client import JiraClient, JiraClientError
+from monitoring_adapter.jira_client import JiraClient, JiraClientError, jira_rich_text_to_plain_text
 from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
 from monitoring_adapter.landing_pad_sources import SUPPORTED_SUFFIXES, load_landing_pad_file
 from monitoring_adapter.log_ingestion import (
@@ -381,6 +381,9 @@ JIRA_POLLING_ENABLED = str(os.getenv("JIRA_POLLING_ENABLED", "true")).strip().lo
 }
 JIRA_POLL_INTERVAL_SECONDS = max(30.0, float(os.getenv("JIRA_POLL_INTERVAL_SECONDS", "60") or 60))
 JIRA_POLL_BATCH_SIZE = max(1, min(int(os.getenv("JIRA_POLL_BATCH_SIZE", "25") or 25), 100))
+JIRA_UNBOUND_INGESTION_ENABLED = str(
+    os.getenv("JIRA_UNBOUND_INGESTION_ENABLED", "false")
+).strip().lower() in {"1", "true", "yes", "on"}
 _JIRA_SESSION_VERSIONS: set[str] = set()
 NONACTIONABLE_ALERT_PUBLISH_ENABLED = str(
     os.getenv("NONACTIONABLE_ALERT_PUBLISH_ENABLED", "false")
@@ -1783,7 +1786,7 @@ async def _opensearch_log_poll_worker() -> None:
 
 
 async def _jira_poll_worker() -> None:
-    """Project recent Jira tickets without requiring a publicly reachable webhook."""
+    """Reconcile Jira updates from a durable, overlapping connection cursor."""
     stop_event = app.state.monitoring_adapter_stop_event
     client = _jira_api_client()
     if client is None:
@@ -1791,32 +1794,49 @@ async def _jira_poll_worker() -> None:
         return
     while not stop_event.is_set():
         try:
-            issues = await client.list_recent_issues(limit=JIRA_POLL_BATCH_SIZE)
-            ingested = 0
-            for issue in reversed(issues):
-                fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
-                version = f"{issue.get('key')}:{fields.get('updated') or fields.get('created') or ''}"
-                if version in _JIRA_SESSION_VERSIONS:
-                    continue
-                payload = {"webhookEvent": "jira:poll", "issue": issue, "event_origin": "jira"}
-                mapped_payload, _ = _jira_payload_to_alert_payload(payload)
-                alert = _build_alert_from_payload(mapped_payload)
-                labels = fields.get("labels") if isinstance(fields.get("labels"), list) else []
-                managed = "managed_by_kaiops" in labels or "kaiops-auto-created" in labels or any(
-                    str(label).startswith(("kaiops_incident_", "kaiops-candidate-")) for label in labels
+            async with app.state.session_factory() as session:
+                repo = ContextEnrichmentRepository(session)
+                connection = await repo.resolve_jira_connection_for_project(project_key=JIRA_PROJECT_KEY)
+                cursor = await repo.jira_sync_cursor(
+                    tenant_id=connection.tenant_id, jira_connection_id=connection.id,
+                    project_key=JIRA_PROJECT_KEY,
                 )
-                if managed and settings.database_enabled and getattr(app.state, "session_factory", None) is not None:
-                    async with app.state.session_factory() as session:
-                        await IncidentRepository(session).save_alert(alert)
-                        await session.commit()
-                    RECENT_ALERTS.appendleft(alert.model_dump(mode="json"))
-                else:
-                    await _publish_ingested_alert(alert)
-                mapped_payload["labels"] = dict(alert.labels)
-                _persist_alert_to_landing_pad(mapped_payload, payload, status="processed")
-                _JIRA_SESSION_VERSIONS.add(version)
-                ingested += 1
-            logger.info("jira_poll_complete project=%s fetched=%s ingested=%s", JIRA_PROJECT_KEY, len(issues), ingested)
+                updated_since = (
+                    cursor.last_jira_updated_timestamp if cursor and cursor.last_jira_updated_timestamp
+                    else datetime.now(UTC) - timedelta(minutes=10)
+                )
+                updated_since = _jira_timestamp(updated_since)
+                tenant_id, connection_id = connection.tenant_id, connection.id
+            issues = await client.search_updated_issues(
+                updated_since=updated_since, limit=JIRA_POLL_BATCH_SIZE,
+            )
+            latest_updated = updated_since
+            latest_key = cursor.last_issue_key if cursor else None
+            reconciled = 0
+            for issue in issues:
+                fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+                issue_key = str(issue.get("key") or "")
+                comments = await client.list_comments(issue_key) if issue_key else []
+                payload = {
+                    "webhookEvent": "jira:poll", "issue": issue, "event_origin": "jira",
+                    "comment": comments[-1] if comments else None,
+                }
+                await _reconcile_jira_issue(payload)
+                issue_updated = _jira_timestamp(fields.get("updated"))
+                if (issue_updated, issue_key) >= (latest_updated, latest_key or ""):
+                    latest_updated, latest_key = issue_updated, issue_key
+                reconciled += 1
+            async with app.state.session_factory() as session:
+                await ContextEnrichmentRepository(session).save_jira_sync_cursor(
+                    tenant_id=tenant_id, jira_connection_id=connection_id,
+                    project_key=JIRA_PROJECT_KEY, jira_updated_at=latest_updated,
+                    issue_key=latest_key, status="succeeded",
+                )
+                await session.commit()
+            logger.info(
+                "jira_poll_complete project=%s fetched=%s reconciled=%s",
+                JIRA_PROJECT_KEY, len(issues), reconciled,
+            )
             _record_worker_success("jira_poll_worker")
         except Exception as exc:
             _record_worker_failure("jira_poll_worker", exc)
@@ -5782,11 +5802,51 @@ def _is_kaiops_managed_jira_update(payload: dict[str, Any]) -> bool:
     )
 
 
-async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -> None:
-    """Runs after the HTTP response has already been sent (via BackgroundTasks)
-    so the webhook receiver can ack Jira with 200 immediately instead of
-    making Jira wait on alert-build + publish + landing-pad persistence.
-    """
+def _jira_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif value:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    else:
+        parsed = datetime.now(UTC)
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _jira_issue_context(payload: dict[str, Any]) -> dict[str, Any]:
+    issue = payload.get("issue") if isinstance(payload.get("issue"), dict) else None
+    if issue is None:
+        raise ValueError("jira webhook payload must contain an issue object")
+    fields = issue.get("fields") if isinstance(issue.get("fields"), dict) else {}
+    project = fields.get("project") if isinstance(fields.get("project"), dict) else {}
+    status = fields.get("status") if isinstance(fields.get("status"), dict) else {}
+    category = status.get("statusCategory") if isinstance(status.get("statusCategory"), dict) else {}
+    assignee = fields.get("assignee") if isinstance(fields.get("assignee"), dict) else {}
+    actor = payload.get("user") if isinstance(payload.get("user"), dict) else {}
+    comment = payload.get("comment") if isinstance(payload.get("comment"), dict) else {}
+    author = comment.get("author") if isinstance(comment.get("author"), dict) else {}
+    issue_key = str(issue.get("key") or "").strip()
+    issue_id = str(issue.get("id") or issue_key).strip()
+    project_key = str(project.get("key") or JIRA_PROJECT_KEY).strip()
+    updated = _jira_timestamp(fields.get("updated") or payload.get("timestamp"))
+    event_seed = ":".join((
+        str(payload.get("webhookEvent") or "jira:update"), issue_id,
+        updated.isoformat(), str(comment.get("id") or ""),
+    ))
+    return {
+        "issue": issue, "fields": fields, "issue_key": issue_key, "issue_id": issue_id,
+        "project_key": project_key, "updated": updated,
+        "event_id": str(payload.get("event_id") or hashlib.sha256(event_seed.encode()).hexdigest()),
+        "status_name": str(status.get("name") or "Unknown"),
+        "status_id": str(status.get("id") or "") or None,
+        "status_category": str(category.get("key") or category.get("name") or ""),
+        "assignee_id": str(assignee.get("accountId") or "") or None,
+        "actor_id": str(author.get("accountId") or actor.get("accountId") or "") or None,
+        "actor_display": str(author.get("displayName") or actor.get("displayName") or "") or None,
+        "comment_text": jira_rich_text_to_plain_text(comment.get("body")).strip(),
+    }
+
+
+async def _process_unbound_jira_issue(payload: dict[str, Any], trace_id: str | None) -> None:
     if _is_kaiops_managed_jira_update(payload):
         issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
         logger.info("ignored KaiOps-originated Jira webhook issue=%s", issue.get("key"))
@@ -5807,11 +5867,103 @@ async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -
     _persist_alert_to_landing_pad(mapped_payload, payload, status="processed")
 
 
+async def _reconcile_jira_issue(
+    payload: dict[str, Any], *, trace_id: str | None = None,
+) -> dict[str, Any]:
+    context = _jira_issue_context(payload)
+    if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
+        raise RuntimeError("database-backed Jira reconciliation is unavailable")
+
+    checksum = "sha256:" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
+    ).hexdigest()
+    async with app.state.session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        connection = await repo.resolve_jira_connection_for_project(
+            project_key=context["project_key"]
+        )
+        receipt, created = await repo.record_jira_webhook_receipt(
+            tenant_id=connection.tenant_id,
+            jira_connection_id=connection.id,
+            jira_issue_id=context["issue_id"],
+            jira_updated_at=context["updated"],
+            event_id=context["event_id"],
+            payload_checksum=checksum,
+        )
+        receipt_id = receipt.receipt_id
+        tenant_id = connection.tenant_id
+        connection_id = connection.id
+        await session.commit()
+    if not created:
+        return {"received": True, "duplicate": True, "ticket_id": context["issue_key"]}
+
+    try:
+        if _is_kaiops_managed_jira_update(payload):
+            async with app.state.session_factory() as session:
+                await ContextEnrichmentRepository(session).mark_jira_webhook_receipt(
+                    receipt_id=receipt_id, status="ignored", error="KaiMS-managed update"
+                )
+                await session.commit()
+            return {
+                "received": True, "ignored": True, "ticket_id": context["issue_key"]
+            }
+        async with app.state.session_factory() as session:
+            repo = ContextEnrichmentRepository(session)
+            binding = await repo.jira_binding_for_issue(
+                tenant_id=tenant_id, jira_connection_id=connection_id,
+                jira_issue_id=context["issue_id"], jira_issue_key=context["issue_key"], lock=True,
+            )
+            if binding is None:
+                await repo.mark_jira_webhook_receipt(
+                    receipt_id=receipt_id,
+                    status="received" if JIRA_UNBOUND_INGESTION_ENABLED else "ignored",
+                    error=None if JIRA_UNBOUND_INGESTION_ENABLED else "unbound issue",
+                )
+                await session.commit()
+                if JIRA_UNBOUND_INGESTION_ENABLED:
+                    await _process_unbound_jira_issue(payload, trace_id)
+                    async with app.state.session_factory() as final_session:
+                        await ContextEnrichmentRepository(final_session).mark_jira_webhook_receipt(
+                            receipt_id=receipt_id, status="processed"
+                        )
+                        await final_session.commit()
+                return {"received": True, "bound": False, "ticket_id": context["issue_key"]}
+
+            await repo.update_jira_binding_from_issue(
+                binding=binding, status_name=context["status_name"],
+                status_id=context["status_id"], status_category=context["status_category"],
+                assignee_account_id=context["assignee_id"], jira_updated_at=context["updated"],
+            )
+            is_done = context["status_category"].strip().casefold() in {"done", "complete", "completed"}
+            if is_done:
+                assigned = str(binding.jira_assignee_account_id or binding.assignee_id or "")
+                if not context["comment_text"] or not context["actor_id"] or (
+                    context["actor_id"].casefold() != assigned.casefold()
+                ):
+                    await repo.block_jira_human_request_without_response(binding=binding)
+                else:
+                    await repo.record_jira_binding_response(
+                        binding=binding, response_text=context["comment_text"],
+                        responder_id=context["actor_id"], responder_display=context["actor_display"],
+                        source_reference=f"{JIRA_API_BASE_URL.rstrip('/')}/browse/{context['issue_key']}",
+                        responded_at=context["updated"],
+                    )
+            await repo.mark_jira_webhook_receipt(receipt_id=receipt_id, status="processed")
+            await session.commit()
+        return {"received": True, "bound": True, "ticket_id": context["issue_key"]}
+    except Exception as exc:
+        async with app.state.session_factory() as session:
+            await ContextEnrichmentRepository(session).mark_jira_webhook_receipt(
+                receipt_id=receipt_id, status="failed", error=str(exc)
+            )
+            await session.commit()
+        raise
+
+
 @app.post("/api/v1/tickets/jira")
 @app.post("/api/v1/alerts/jira")
 async def ingest_jira_webhook(
     payload: dict = ALERT_BODY,
-    background_tasks: BackgroundTasks = None,
     token: str | None = None,
     x_webhook_token: str | None = Header(default=None),
     x_trace_id: str | None = Header(default=None),
@@ -5827,9 +5979,8 @@ async def ingest_jira_webhook(
     uses for every other monitoring provider), so register-webhook's
     auto-generated URL for the "jira" provider resolves to a real receiver.
 
-    Responds 200 immediately after basic validation; the actual alert build +
-    publish + landing-pad persistence happens in a background task so slow
-    downstream steps can't cause Jira to time out and retry the webhook.
+    Persists and reconciles the receipt before returning 2xx. This prevents an
+    acknowledged webhook from disappearing when the process exits.
     """
     if not JIRA_WEBHOOK_SECRET:
         raise HTTPException(status_code=503, detail="Jira ingestion is not configured (JIRA_WEBHOOK_SECRET unset)")
@@ -5837,15 +5988,17 @@ async def ingest_jira_webhook(
     if not provided_token or provided_token != JIRA_WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="invalid or missing Jira webhook token")
 
-    issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
-    if not isinstance(issue, dict):
-        raise HTTPException(status_code=400, detail="jira webhook payload must contain an issue object")
-    issue_key = str(issue.get("key") or "unknown-issue")
-    webhook_event = str(payload.get("webhookEvent") or "").strip()
-
-    background_tasks.add_task(_process_jira_webhook, payload, x_trace_id)
-    logger.info("received jira webhook event=%s issue=%s", webhook_event, issue_key)
-    return {"received": True, "webhookEvent": webhook_event, "ticket_id": issue_key}
+    try:
+        result = await _reconcile_jira_issue(payload, trace_id=x_trace_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    logger.info(
+        "reconciled jira webhook event=%s issue=%s bound=%s duplicate=%s",
+        payload.get("webhookEvent"), result.get("ticket_id"), result.get("bound"), result.get("duplicate"),
+    )
+    return {**result, "webhookEvent": str(payload.get("webhookEvent") or "")}
 
 
 @app.get("/alerts")

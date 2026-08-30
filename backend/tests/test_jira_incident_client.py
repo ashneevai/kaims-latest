@@ -104,3 +104,54 @@ async def test_jira_actions_and_issue_bindings_are_connection_scoped(sqlite_sess
             assignee_account_id="account-1", payload=payload,
         ) for index, connection_id in enumerate(connections, start=1)]
         assert bindings[0].binding_id != bindings[1].binding_id
+
+
+@pytest.mark.asyncio
+async def test_jira_webhook_receipt_is_durable_and_idempotent(sqlite_session_factory):
+    connection_id = uuid4()
+    updated_at = datetime(2026, 8, 31, 8, 15, tzinfo=UTC)
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        first, created = await repo.record_jira_webhook_receipt(
+            tenant_id="tenant-a", jira_connection_id=connection_id, jira_issue_id="10042",
+            jira_updated_at=updated_at, event_id="event-42", payload_checksum="sha256:first",
+        )
+        await session.commit()
+        assert created is True
+
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        duplicate, created = await repo.record_jira_webhook_receipt(
+            tenant_id="tenant-a", jira_connection_id=connection_id, jira_issue_id="10042",
+            jira_updated_at=updated_at, event_id="event-42", payload_checksum="sha256:first",
+        )
+        assert created is False
+        assert duplicate.receipt_id == first.receipt_id
+        await repo.mark_jira_webhook_receipt(receipt_id=duplicate.receipt_id, status="processed")
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_jira_poll_cursor_only_advances_on_success(sqlite_session_factory):
+    connection_id = uuid4()
+    first_updated = datetime(2026, 8, 31, 7, 0, tzinfo=UTC)
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        first = await repo.save_jira_sync_cursor(
+            tenant_id="tenant-a", jira_connection_id=connection_id, project_key="KAN",
+            jira_updated_at=first_updated, issue_key="KAN-7", status="succeeded",
+        )
+        assert first.version == 1
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        failed = await repo.save_jira_sync_cursor(
+            tenant_id="tenant-a", jira_connection_id=connection_id, project_key="KAN",
+            jira_updated_at=datetime(2026, 8, 31, 9, 0, tzinfo=UTC), issue_key="KAN-9",
+            status="failed", error="temporary Jira failure",
+        )
+        assert failed.last_jira_updated_timestamp.replace(tzinfo=UTC) == first_updated
+        assert failed.last_issue_key == "KAN-7"
+        assert failed.poll_status == "failed"
+        await session.commit()
