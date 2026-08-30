@@ -1683,17 +1683,22 @@ class HumanEvidenceRequestRecord(Base, TimestampMixin):
 class JiraIncidentBindingRecord(Base, TimestampMixin):
     __tablename__ = "jira_incident_bindings"
     __table_args__ = (
-        UniqueConstraint("tenant_id", "jira_issue_key", name="uq_jira_binding_issue"),
+        UniqueConstraint(
+            "tenant_id", "jira_connection_id", "jira_issue_key", name="uq_jira_binding_connection_issue"
+        ),
         UniqueConstraint("tenant_id", "incident_id", "binding_version", name="uq_jira_binding_version"),
         Index("idx_jira_binding_current", "tenant_id", "incident_id", "status"),
     )
 
     binding_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    jira_connection_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
     incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     jira_issue_key: Mapped[str] = mapped_column(String(64), index=True)
+    jira_issue_id: Mapped[str | None] = mapped_column(String(64), index=True)
     jira_project_key: Mapped[str] = mapped_column(String(64), index=True)
     assignee_id: Mapped[str] = mapped_column(String(255), index=True)
+    jira_assignee_account_id: Mapped[str | None] = mapped_column(String(255), index=True)
     assignee_group: Mapped[str | None] = mapped_column(String(255), index=True)
     recommendation_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
     rca_version: Mapped[int] = mapped_column(Integer)
@@ -1705,19 +1710,31 @@ class JiraIncidentBindingRecord(Base, TimestampMixin):
     approval_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     status: Mapped[str] = mapped_column(String(32), index=True, default="pending")
     jira_status: Mapped[str] = mapped_column(String(128), index=True)
+    jira_status_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    jira_status_category: Mapped[str | None] = mapped_column(String(64), index=True)
     ownership: Mapped[str] = mapped_column(String(16), default="human")
+    closure_authority: Mapped[str] = mapped_column(String(16), default="jira")
+    binding_purpose: Mapped[str] = mapped_column(String(32), default="human_evidence")
+    hitl_request_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
     closure_policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     last_jira_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    jira_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     binding_version: Mapped[int] = mapped_column(Integer, default=1)
+    webhook_version: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class JiraSyncCursorRecord(Base, TimestampMixin):
     __tablename__ = "jira_sync_cursors"
-    __table_args__ = (UniqueConstraint("tenant_id", "jira_project_key", name="uq_jira_sync_cursor"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "jira_connection_id", "jira_project_key", name="uq_jira_sync_cursor_connection"
+        ),
+    )
 
     cursor_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    jira_connection_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
     jira_project_key: Mapped[str] = mapped_column(String(64), index=True)
     last_successful_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_jira_updated_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
@@ -1725,6 +1742,85 @@ class JiraSyncCursorRecord(Base, TimestampMixin):
     poll_status: Mapped[str] = mapped_column(String(32), default="never", index=True)
     poll_error: Mapped[str | None] = mapped_column(Text)
     version: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class HumanEvidenceResponseVersionRecord(Base):
+    __tablename__ = "human_evidence_response_versions"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "request_id", "response_version", name="uq_human_response_version"),
+        UniqueConstraint("tenant_id", "evidence_id", name="uq_human_response_evidence"),
+        Index("idx_human_response_incident", "tenant_id", "incident_id", "created_at"),
+    )
+
+    response_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    requirement_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    request_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    response_version: Mapped[int] = mapped_column(Integer)
+    responder_id: Mapped[str] = mapped_column(String(255))
+    responder_display: Mapped[str | None] = mapped_column(String(255))
+    source_type: Mapped[str] = mapped_column(String(32))
+    source_reference: Mapped[str | None] = mapped_column(String(1536))
+    response_text: Mapped[str] = mapped_column(Text)
+    evidence_id: Mapped[str] = mapped_column(String(128))
+    content_checksum: Mapped[str] = mapped_column(String(71))
+    supersedes_response_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class JiraActionOutboxRecord(Base, TimestampMixin):
+    __tablename__ = "jira_action_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "jira_connection_id", "idempotency_key", name="uq_jira_action_idempotency"
+        ),
+        Index("idx_jira_action_claim", "status", "available_at", "lease_expires_at"),
+    )
+
+    action_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    jira_connection_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    incident_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    binding_id: Mapped[UUID | None] = mapped_column(Uuid(as_uuid=True), index=True)
+    action_type: Mapped[str] = mapped_column(String(32), index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(255))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class JiraWebhookReceiptRecord(Base, TimestampMixin):
+    __tablename__ = "jira_webhook_receipts"
+    __table_args__ = (
+        UniqueConstraint("jira_connection_id", "event_id", name="uq_jira_webhook_event"),
+        UniqueConstraint(
+            "jira_connection_id",
+            "jira_issue_id",
+            "jira_updated_at",
+            "event_id",
+            name="uq_jira_webhook_issue_update",
+        ),
+        Index("idx_jira_webhook_processing", "processing_status", "received_at"),
+    )
+
+    receipt_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    jira_connection_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    jira_issue_id: Mapped[str] = mapped_column(String(64), index=True)
+    jira_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    event_id: Mapped[str] = mapped_column(String(255))
+    webhook_version: Mapped[int] = mapped_column(Integer, default=1)
+    payload_checksum: Mapped[str] = mapped_column(String(71))
+    processing_status: Mapped[str] = mapped_column(String(32), default="received", index=True)
+    processing_error: Mapped[str | None] = mapped_column(Text)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EvaluationRecord(Base, TimestampMixin):
