@@ -15,6 +15,22 @@ def load_monitoring_app_module():
     return module
 
 
+def test_jira_client_is_disabled_when_any_required_setting_is_missing(monkeypatch):
+    module = load_monitoring_app_module()
+    complete = {
+        "JIRA_API_BASE_URL": "https://example.atlassian.net",
+        "JIRA_API_EMAIL": "service@example.com",
+        "JIRA_API_TOKEN": "test-token",
+        "JIRA_PROJECT_KEY": "OPS",
+        "JIRA_ISSUE_TYPE": "Incident",
+    }
+
+    for missing in complete:
+        for name, value in complete.items():
+            monkeypatch.setattr(module, name, "" if name == missing else value)
+        assert module._jira_api_client() is None
+
+
 def valid_payload() -> dict:
     return {
         "project": {

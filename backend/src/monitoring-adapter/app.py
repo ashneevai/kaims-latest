@@ -301,13 +301,11 @@ JIRA_WEBHOOK_SECRET = str(os.getenv("JIRA_WEBHOOK_SECRET", "") or "").strip()
 # Jira's own webhook (unchanged, JIRA_WEBHOOK_SECRET above) becomes the
 # only door back into the landing pad. Off by default so this can be
 # rolled out only once real Jira credentials are configured.
-JIRA_API_BASE_URL = str(
-    os.getenv("JIRA_API_BASE_URL", "https://kaiops-test.atlassian.net") or ""
-).strip()
+JIRA_API_BASE_URL = str(os.getenv("JIRA_API_BASE_URL", "") or "").strip()
 JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL", "") or "").strip()
 JIRA_API_TOKEN = str(os.getenv("JIRA_API_TOKEN", "") or "").strip()
-JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "KAN") or "").strip()
-JIRA_ISSUE_TYPE = str(os.getenv("JIRA_ISSUE_TYPE", "Bug") or "").strip()
+JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
+JIRA_ISSUE_TYPE = str(os.getenv("JIRA_ISSUE_TYPE", "") or "").strip()
 CENTRALIZED_JIRA_ROUTING_ENABLED = str(os.getenv("CENTRALIZED_JIRA_ROUTING_ENABLED", "false")).strip().lower() in {
     "1",
     "true",
@@ -5260,7 +5258,15 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
 
 
 def _jira_api_client() -> JiraClient | None:
-    if not (JIRA_API_BASE_URL and JIRA_API_EMAIL and JIRA_API_TOKEN and JIRA_PROJECT_KEY):
+    if not all(
+        (
+            JIRA_API_BASE_URL,
+            JIRA_API_EMAIL,
+            JIRA_API_TOKEN,
+            JIRA_PROJECT_KEY,
+            JIRA_ISSUE_TYPE,
+        )
+    ):
         return None
     return JiraClient(
         base_url=JIRA_API_BASE_URL,
