@@ -381,6 +381,7 @@ JIRA_POLLING_ENABLED = str(os.getenv("JIRA_POLLING_ENABLED", "true")).strip().lo
 }
 JIRA_POLL_INTERVAL_SECONDS = max(30.0, float(os.getenv("JIRA_POLL_INTERVAL_SECONDS", "60") or 60))
 JIRA_POLL_BATCH_SIZE = max(1, min(int(os.getenv("JIRA_POLL_BATCH_SIZE", "25") or 25), 100))
+JIRA_ACTION_MAX_ATTEMPTS = max(1, int(os.getenv("JIRA_ACTION_MAX_ATTEMPTS", "8") or 8))
 JIRA_UNBOUND_INGESTION_ENABLED = str(
     os.getenv("JIRA_UNBOUND_INGESTION_ENABLED", "false")
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -1938,6 +1939,7 @@ async def _jira_action_worker() -> None:
                             await ContextEnrichmentRepository(session).retry_jira_action(
                                 action_id=action["action_id"], worker_id=worker_id,
                                 error=str(exc), retry_after_seconds=min(900, 30 * 2 ** min(action["attempt_count"], 5)),
+                                max_attempts=JIRA_ACTION_MAX_ATTEMPTS,
                             )
                             await session.commit()
                         logger.exception("governed Jira action failed", extra={"action_id": str(action["action_id"])})
@@ -4915,6 +4917,7 @@ async def get_jira_lifecycle_status() -> dict[str, Any]:
     outbound_ready = not missing_outbound
     connection_payload: dict[str, Any] | None = None
     cursor_payload: dict[str, Any] | None = None
+    queue_payload: dict[str, Any] | None = None
     if settings.database_enabled and JIRA_PROJECT_KEY:
         async with app.state.session_factory() as session:
             repo = ContextEnrichmentRepository(session)
@@ -4943,6 +4946,11 @@ async def get_jira_lifecycle_status() -> dict[str, Any]:
                         "last_polled_at": _json_safe(cursor.last_polled_at),
                         "version": cursor.version,
                     }
+                queue_payload = await repo.jira_lifecycle_queue_summary(
+                    tenant_id=connection.tenant_id,
+                    jira_connection_id=connection.id,
+                )
+                queue_payload["oldest_unfinished_at"] = _json_safe(queue_payload["oldest_unfinished_at"])
     lifecycle_ready = outbound_ready and configured["webhook_secret"] and connection_payload is not None
     return {
         "status": "ready" if lifecycle_ready else "configuration_required",
@@ -4953,6 +4961,7 @@ async def get_jira_lifecycle_status() -> dict[str, Any]:
         "webhook_ready": configured["webhook_secret"],
         "durable_connection": connection_payload,
         "poll_cursor": cursor_payload,
+        "queue": queue_payload,
         "workers": {
             "poll": _jira_worker_snapshot("jira_poll_task", enabled=JIRA_POLLING_ENABLED and outbound_ready),
             "actions": _jira_worker_snapshot("jira_action_task", enabled=outbound_ready),

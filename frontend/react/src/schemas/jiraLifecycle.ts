@@ -20,6 +20,11 @@ export const JiraLifecycleStatusSchema = z.object({
     status: z.string().nullable(), last_issue_key: z.string().nullable(),
     last_jira_updated_at: z.string().nullable(), last_polled_at: z.string().nullable(), version: z.number(),
   }).nullable(),
+  queue: z.object({
+    actions: z.object({ pending: z.number(), processing: z.number(), retry: z.number(), failed: z.number(), completed: z.number() }).passthrough(),
+    oldest_unfinished_at: z.string().nullable(),
+    webhooks: z.record(z.number()),
+  }).nullable(),
   workers: z.object({ poll: WorkerSchema, actions: WorkerSchema }),
 });
 

@@ -8813,14 +8813,49 @@ class ContextEnrichmentRepository(EvaluationRepository):
 
     async def retry_jira_action(
         self, *, action_id: UUID | str, worker_id: str, error: str, retry_after_seconds: int,
+        max_attempts: int = 8,
     ) -> None:
         row = await self._locked_jira_action(action_id=action_id, worker_id=worker_id)
-        row.status = "retry"
+        row.status = "failed" if row.attempt_count >= max(1, int(max_attempts)) else "retry"
         row.available_at = utc_now() + timedelta(seconds=max(1, retry_after_seconds))
         row.lease_owner = None
         row.lease_expires_at = None
         row.last_error = str(error)[:4000]
         await self.session.flush()
+
+    async def jira_lifecycle_queue_summary(
+        self, *, tenant_id: str, jira_connection_id: UUID | str,
+    ) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="Jira lifecycle queue summary")
+        connection_id = self._to_uuid(jira_connection_id)
+        action_rows = (await self.session.execute(select(
+            JiraActionOutboxRecord.status,
+            func.count(JiraActionOutboxRecord.action_id),
+            func.min(JiraActionOutboxRecord.created_at),
+        ).where(
+            JiraActionOutboxRecord.tenant_id == tenant,
+            JiraActionOutboxRecord.jira_connection_id == connection_id,
+        ).group_by(JiraActionOutboxRecord.status))).all()
+        webhook_rows = (await self.session.execute(select(
+            JiraWebhookReceiptRecord.processing_status,
+            func.count(JiraWebhookReceiptRecord.receipt_id),
+        ).where(
+            JiraWebhookReceiptRecord.tenant_id == tenant,
+            JiraWebhookReceiptRecord.jira_connection_id == connection_id,
+        ).group_by(JiraWebhookReceiptRecord.processing_status))).all()
+        action_counts = {status: 0 for status in ("pending", "processing", "retry", "failed", "completed")}
+        oldest_unfinished_at = None
+        for status, count, oldest_at in action_rows:
+            action_counts[str(status)] = int(count or 0)
+            if status in {"pending", "processing", "retry"} and (
+                oldest_unfinished_at is None or (oldest_at is not None and oldest_at < oldest_unfinished_at)
+            ):
+                oldest_unfinished_at = oldest_at
+        return {
+            "actions": action_counts,
+            "oldest_unfinished_at": oldest_unfinished_at,
+            "webhooks": {str(status): int(count or 0) for status, count in webhook_rows},
+        }
 
     async def _locked_jira_action(
         self, *, action_id: UUID | str, worker_id: str,

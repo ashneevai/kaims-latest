@@ -157,6 +157,10 @@ async function installScenario(page, options = {}) {
           status: "succeeded", last_issue_key: "KAN-42",
           last_jira_updated_at: new Date().toISOString(), last_polled_at: new Date().toISOString(), version: 3,
         } : null,
+        queue: ready ? {
+          actions: { pending: 2, processing: 0, retry: 1, failed: 0, completed: 7 },
+          oldest_unfinished_at: new Date().toISOString(), webhooks: { processed: 4 },
+        } : null,
         workers: {
           poll: { state: ready ? "running" : "disabled", enabled: ready },
           actions: { state: ready ? "running" : "disabled", enabled: ready },
@@ -606,6 +610,8 @@ test("Jira lifecycle readiness distinguishes missing secrets from an active conn
   await expect(panel).toContainText("KAN connected");
   await expect(panel).toContainText("Poll: running · Actions: running");
   await expect(panel).toContainText("KAN-42");
+  await expect(panel).toContainText("2 pending · 1 retry · 0 failed");
+  await expect(panel).toContainText("4 recorded");
 });
 
 test("manual closure sends only operator intent while identity remains server-derived", async ({ page }) => {

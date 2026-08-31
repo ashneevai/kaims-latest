@@ -183,3 +183,31 @@ async def test_jira_poll_cursor_only_advances_on_success(sqlite_session_factory)
         assert failed.last_issue_key == "KAN-7"
         assert failed.poll_status == "failed"
         await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_jira_action_stops_retrying_at_max_attempts(sqlite_session_factory, monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    incident_id = uuid4()
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        connection = await repo.ensure_jira_connection_for_project(
+            tenant_id="default", project_key="KAN", endpoint_url="https://example.atlassian.net",
+            issue_type="Bug",
+        )
+        action = await repo.enqueue_jira_action(
+            tenant_id="default", jira_connection_id=connection.id, incident_id=incident_id,
+            action_type="ensure_hitl_issue", idempotency_key="bounded-retry", payload={},
+        )
+        claimed = await repo.claim_jira_actions(worker_id="worker-1", limit=1, lease_seconds=30)
+        assert claimed[0].action_id == action.action_id
+        await repo.retry_jira_action(
+            action_id=action.action_id, worker_id="worker-1", error="Jira unavailable",
+            retry_after_seconds=1, max_attempts=1,
+        )
+        summary = await repo.jira_lifecycle_queue_summary(
+            tenant_id="default", jira_connection_id=connection.id,
+        )
+        assert summary["actions"]["failed"] == 1
+        assert summary["actions"]["retry"] == 0
+        assert await repo.claim_jira_actions(worker_id="worker-2", limit=1, lease_seconds=30) == []
