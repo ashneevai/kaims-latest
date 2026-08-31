@@ -137,6 +137,32 @@ async function installScenario(page, options = {}) {
       return route.fulfill(json(path.includes("summary") ? { total_events: 3, allowed: 2, review: 1, blocked: 0 } : { events: [] }));
     }
     if (path === "/applications") return route.fulfill(json({ data: { rows: options.withApplication ? [application] : [] } }));
+    if (path === "/monitoring/jira/status") {
+      const ready = Boolean(options.jiraReady);
+      return route.fulfill(json({
+        status: ready ? "ready" : "configuration_required",
+        tenant_id: "default",
+        configured: {
+          base_url: true, service_account_email: ready, api_token: ready,
+          project_key: true, issue_type: true, webhook_secret: ready,
+        },
+        missing_outbound_settings: ready ? [] : ["service_account_email", "api_token"],
+        outbound_ready: ready,
+        webhook_ready: ready,
+        durable_connection: ready ? {
+          id: "77777777-7777-4777-8777-777777777777", tenant_id: "default",
+          project_key: "KAN", active: true, endpoint_url: "https://jira.example.test",
+        } : null,
+        poll_cursor: ready ? {
+          status: "succeeded", last_issue_key: "KAN-42",
+          last_jira_updated_at: new Date().toISOString(), last_polled_at: new Date().toISOString(), version: 3,
+        } : null,
+        workers: {
+          poll: { state: ready ? "running" : "disabled", enabled: ready },
+          actions: { state: ready ? "running" : "disabled", enabled: ready },
+        },
+      }));
+    }
     if (path === `/applications/${APPLICATION_ID}/history`) return route.fulfill(json({ rows: onboardingEvents }));
     if (path === `/applications/${APPLICATION_ID}/validations`) return route.fulfill(json({ rows: [{ status: "passed", created_at: new Date().toISOString() }] }));
     if (path === `/applications/${APPLICATION_ID}/dashboards`) return route.fulfill(json({ rows: [{ title: "Checkout golden signals" }] }));
@@ -562,6 +588,24 @@ test("onboarding evidence drives readiness and activation without estimated capa
   await expect(page.getByLabel("Project ID")).toHaveValue("demo-project");
   await expect(page.getByRole("button", { name: "Add simulator connection" })).toBeEnabled();
   await expect(page.locator("body")).not.toContainText(/estimated/i);
+});
+
+test("Jira lifecycle readiness distinguishes missing secrets from an active connection", async ({ page }) => {
+  await installScenario(page);
+  await signIn(page, "/integrations");
+  const panel = page.locator(".jira-readiness-panel");
+  await expect(panel).toContainText("Jira configuration is incomplete");
+  await expect(panel).toContainText("service account email, api token, webhook secret");
+  await expect(panel).not.toContainText(/secret-token|api-token-value/i);
+
+  await page.unroute("**/api-gateway/**");
+  await installScenario(page, { jiraReady: true });
+  await page.evaluate(() => localStorage.clear());
+  await signIn(page, "/integrations");
+  await expect(panel).toContainText("Jira lifecycle is ready");
+  await expect(panel).toContainText("KAN connected");
+  await expect(panel).toContainText("Poll: running · Actions: running");
+  await expect(panel).toContainText("KAN-42");
 });
 
 test("manual closure sends only operator intent while identity remains server-derived", async ({ page }) => {
