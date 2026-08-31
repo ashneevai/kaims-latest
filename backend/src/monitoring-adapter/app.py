@@ -4882,6 +4882,84 @@ async def get_monitoring_health(tenant_id: str = "default") -> dict[str, Any]:
     return {"rows": rows, "count": len(rows)}
 
 
+def _jira_worker_snapshot(task_name: str, *, enabled: bool) -> dict[str, Any]:
+    task = getattr(app.state, task_name, None)
+    if not enabled:
+        state = "disabled"
+    elif task is None:
+        state = "not_started"
+    elif task.cancelled():
+        state = "cancelled"
+    elif task.done():
+        state = "failed" if task.exception() is not None else "stopped"
+    else:
+        state = "running"
+    return {"state": state, "enabled": enabled}
+
+
+@app.get("/monitoring/jira/status")
+async def get_jira_lifecycle_status() -> dict[str, Any]:
+    """Return secret-free Jira lifecycle readiness and durable binding state."""
+    configured = {
+        "base_url": bool(JIRA_API_BASE_URL),
+        "service_account_email": bool(JIRA_API_EMAIL),
+        "api_token": bool(JIRA_API_TOKEN),
+        "project_key": bool(JIRA_PROJECT_KEY),
+        "issue_type": bool(JIRA_ISSUE_TYPE),
+        "webhook_secret": bool(JIRA_WEBHOOK_SECRET),
+    }
+    missing_outbound = [
+        name for name in ("base_url", "service_account_email", "api_token", "project_key", "issue_type")
+        if not configured[name]
+    ]
+    outbound_ready = not missing_outbound
+    connection_payload: dict[str, Any] | None = None
+    cursor_payload: dict[str, Any] | None = None
+    if settings.database_enabled and JIRA_PROJECT_KEY:
+        async with app.state.session_factory() as session:
+            repo = ContextEnrichmentRepository(session)
+            try:
+                connection = await repo.resolve_jira_connection_for_project(project_key=JIRA_PROJECT_KEY)
+            except LookupError:
+                connection = None
+            if connection is not None:
+                connection_payload = {
+                    "id": str(connection.id),
+                    "tenant_id": connection.tenant_id,
+                    "project_key": JIRA_PROJECT_KEY,
+                    "active": bool(connection.active),
+                    "endpoint_url": connection.endpoint_url,
+                }
+                cursor = await repo.jira_sync_cursor(
+                    tenant_id=connection.tenant_id,
+                    jira_connection_id=connection.id,
+                    project_key=JIRA_PROJECT_KEY,
+                )
+                if cursor is not None:
+                    cursor_payload = {
+                        "status": cursor.poll_status,
+                        "last_issue_key": cursor.last_issue_key,
+                        "last_jira_updated_at": _json_safe(cursor.last_jira_updated_timestamp),
+                        "last_polled_at": _json_safe(cursor.last_polled_at),
+                        "version": cursor.version,
+                    }
+    lifecycle_ready = outbound_ready and configured["webhook_secret"] and connection_payload is not None
+    return {
+        "status": "ready" if lifecycle_ready else "configuration_required",
+        "tenant_id": JIRA_TENANT_ID,
+        "configured": configured,
+        "missing_outbound_settings": missing_outbound,
+        "outbound_ready": outbound_ready,
+        "webhook_ready": configured["webhook_secret"],
+        "durable_connection": connection_payload,
+        "poll_cursor": cursor_payload,
+        "workers": {
+            "poll": _jira_worker_snapshot("jira_poll_task", enabled=JIRA_POLLING_ENABLED and outbound_ready),
+            "actions": _jira_worker_snapshot("jira_action_task", enabled=outbound_ready),
+        },
+    }
+
+
 @app.get("/monitoring/audit")
 async def get_monitoring_audit(tenant_id: str = "default", limit: int = 100) -> dict[str, Any]:
     session_factory = _db_required()
