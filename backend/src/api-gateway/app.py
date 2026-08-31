@@ -3883,6 +3883,21 @@ async def post_incident_context_gap_response(
     )
 
 
+@app.get("/monitoring/jira/status")
+async def get_jira_lifecycle_status(
+    request: Request,
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="GET",
+        path="/monitoring/jira/status",
+        target_base=settings.monitoring_adapter_url,
+        payload={},
+        trace_id=trace_id_from_header(x_trace_id),
+    )
+
+
 @app.get("/rag/knowledge-drafts")
 async def list_knowledge_rag_drafts(
     request: Request,

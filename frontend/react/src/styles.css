@@ -1288,6 +1288,20 @@ textarea:focus {
 .weekday-picker input, .checkbox-row input { width: auto; }
 .checkbox-row { flex-direction: row !important; align-items: center; }
 .status-message { padding: 10px 12px; border-left: 3px solid #2f9077; background: #eef9f5; }
+.jira-readiness-panel { border-left: 5px solid #c0841a; }
+.jira-readiness-panel.is-ready { border-left-color: #0c8b68; }
+.jira-readiness-summary { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; padding: 14px; border: 1px solid var(--line, #d7e2ea); border-radius: 12px; background: var(--panel-soft, #f7fafc); }
+.jira-readiness-summary > div:nth-child(2) { display: grid; gap: 4px; }
+.jira-readiness-summary span { color: var(--muted, #526d82); font-size: .78rem; }
+.jira-readiness-icon { display: grid; width: 38px; height: 38px; place-items: center; border-radius: 10px; color: #9a6300; background: #fff3d9; }
+.jira-readiness-panel.is-ready .jira-readiness-icon { color: #087158; background: #e8f8f2; }
+.jira-readiness-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 12px 0 0; }
+.jira-readiness-grid div { padding: 12px; border: 1px solid var(--line, #d7e2ea); }
+.jira-readiness-grid dt { color: var(--muted, #526d82); font-size: .7rem; }
+.jira-readiness-grid dd { margin: 4px 0 0; font-size: .8rem; font-weight: 750; overflow-wrap: anywhere; }
+.jira-missing-settings { display: flex; gap: 10px; margin-top: 12px; padding: 12px; color: #795200; border: 1px solid #e0bd6b; border-radius: 10px; background: #fff9e9; }
+.jira-missing-settings p, .jira-missing-settings small { display: block; margin: 3px 0 0; color: inherit; }
+@media (max-width: 800px) { .jira-readiness-grid { grid-template-columns: 1fr 1fr; } .jira-readiness-summary { grid-template-columns: auto 1fr; } .jira-readiness-summary > .decision-readiness { grid-column: 2; justify-self: start; } }
 .approval-review-summary { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; margin: 12px 0; }
 .approval-review-summary div { padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-soft); }
 .approval-review-summary small, .approval-review-summary strong { display: block; overflow-wrap: anywhere; }

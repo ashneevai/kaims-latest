@@ -1,9 +1,10 @@
 import { useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, RefreshCw, X } from "lucide-react";
+import { CheckCircle2, CircleAlert, Link2, Pencil, RefreshCw, X } from "lucide-react";
 import { useRouteRuntime } from "../../app/routeRuntime";
 import { applicationKeys, applicationsQueryOptions, createApplication, updateApplication } from "../../services/applications";
 import type { Application, ApplicationUpdate, NewApplication } from "../../schemas/applications";
+import { jiraLifecycleStatusQueryOptions } from "../../services/jiraLifecycle";
 
 const initialForm: NewApplication = { tenant_id: "default", name: "", owner_team: "platform-ops", owner_email: null, environment: "prod", namespace: "default", region: "us-east-1", technology: "python-fastapi", metrics_endpoint: "http://api-gateway:8000/metrics", monitoring_platform: "prometheus", labels: { security: "internal", compliance: "sox", workload_kind: "Deployment" } };
 const labelsToText = (labels: unknown) => labels && typeof labels === "object" ? Object.entries(labels).map(([key, value]) => `${key}=${String(value)}`).join(",") : "";
@@ -14,6 +15,7 @@ export default function IntegrationsRoute() {
   const { session } = useRouteRuntime();
   const queryClient = useQueryClient();
   const applications = useQuery(applicationsQueryOptions(session.accessToken));
+  const jira = useQuery(jiraLifecycleStatusQueryOptions(session.accessToken));
   const [form, setForm] = useState<NewApplication>(initialForm);
   const [labelsText, setLabelsText] = useState(labelsToText(initialForm.labels));
   const [deploymentMode, setDeploymentMode] = useState("cloud_agnostic");
@@ -52,6 +54,12 @@ export default function IntegrationsRoute() {
   const cancel = () => { setEditing(null); setForm(initialForm); setLabelsText(labelsToText(initialForm.labels)); setDeploymentMode("cloud_agnostic"); mutation.reset(); };
 
   return <section className="grid single-col operational-route onboarding-workspace">
+    <article className={`panel jira-readiness-panel ${jira.data?.status === "ready" ? "is-ready" : "is-blocked"}`}>
+      <div className="panel-head"><div><span className="discovery-eyebrow">Governed work management</span><h2>Jira lifecycle connection</h2><p>Incident tickets, human-evidence requests, reconciliation, and closure updates use this durable connection.</p></div><button className="icon-button" title="Refresh Jira status" aria-label="Refresh Jira status" onClick={() => jira.refetch()} disabled={jira.isFetching}><RefreshCw size={17} /></button></div>
+      {jira.isLoading ? <p className="status-message" role="status">Checking Jira lifecycle readiness…</p> : null}
+      {jira.error ? <p className="error" role="alert">Jira lifecycle status is unavailable: {jira.error.message}</p> : null}
+      {jira.data ? <><div className="jira-readiness-summary"><div className="jira-readiness-icon">{jira.data.status === "ready" ? <CheckCircle2 /> : <CircleAlert />}</div><div><strong>{jira.data.status === "ready" ? "Jira lifecycle is ready" : "Jira configuration is incomplete"}</strong><span>{jira.data.status === "ready" ? "Outbound actions and inbound webhook reconciliation are active." : "KaiMS will not create or update Jira issues until the required secrets are configured."}</span></div><span className={`decision-readiness ${jira.data.status === "ready" ? "is-ready" : "is-blocked"}`}>{jira.data.status === "ready" ? "Ready" : "Action required"}</span></div><dl className="jira-readiness-grid"><div><dt>Outbound API</dt><dd>{jira.data.outbound_ready ? "Ready" : "Disabled"}</dd></div><div><dt>Inbound webhook</dt><dd>{jira.data.webhook_ready ? "Ready" : "Disabled"}</dd></div><div><dt>Durable binding</dt><dd>{jira.data.durable_connection ? `${jira.data.durable_connection.project_key} connected` : "Not created"}</dd></div><div><dt>Workers</dt><dd>Poll: {jira.data.workers.poll.state} · Actions: {jira.data.workers.actions.state}</dd></div></dl>{jira.data.status !== "ready" ? <div className="jira-missing-settings"><Link2 size={17} /><div><strong>Required configuration</strong><p>{[...jira.data.missing_outbound_settings, ...(!jira.data.webhook_ready ? ["webhook_secret"] : [])].map((value) => value.replaceAll("_", " ")).join(", ") || "Create the durable connection by restarting the adapter."}</p><small>Secrets must be supplied through the runtime environment; they are never shown or stored in this view.</small></div></div> : jira.data.poll_cursor ? <p className="status-message">Last reconciliation: {jira.data.poll_cursor.last_polled_at || "pending"}{jira.data.poll_cursor.last_issue_key ? ` · ${jira.data.poll_cursor.last_issue_key}` : ""}</p> : null}</> : null}
+    </article>
     <article className="panel onboarding-form-panel">
       <div className="panel-head"><div><span className="discovery-eyebrow">Connection profile</span><h2>{editing ? `Edit ${editing.name}` : "Connect an application"}</h2><p>{editing ? "Update the ownership, deployment, and monitoring contract used by discovery and resolution." : "Provide the minimum trustworthy metadata KaiMS needs to discover, monitor, and safely remediate this application."}</p></div>{editing ? <button className="icon-button" type="button" title="Cancel editing" aria-label="Cancel editing" onClick={cancel}><X size={17} /></button> : null}</div>
       <form className="form onboarding-form" onSubmit={submit}>

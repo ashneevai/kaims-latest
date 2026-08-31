@@ -367,6 +367,7 @@ def test_analyze_response_runs_local_rules_when_opted_in() -> None:
 def test_gateway_operational_auth_policy_marks_admin_routes() -> None:
     assert route_auth_rule("POST", "/onboarding/complete") == {"Administrator"}
     assert route_auth_rule("GET", "/monitoring/integrations") == {"Administrator"}
+    assert route_auth_rule("GET", "/monitoring/jira/status") == {"Administrator"}
     assert route_auth_rule("POST", "/rag/documents") == {"Administrator", "L2 Engineer", "L3 Engineer"}
     assert route_auth_rule("POST", "/approval/approve") == {"Administrator", "L2 Engineer", "L3 Engineer"}
     assert route_auth_rule("POST", "/remediation/actions/action-id/emergency-stop") == {"Administrator", "L2 Engineer", "L3 Engineer"}
