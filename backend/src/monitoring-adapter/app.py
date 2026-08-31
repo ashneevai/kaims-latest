@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import heapq
 import json
@@ -54,7 +53,7 @@ from common.topics import (
     RAW_ALERTS,
     RESOLUTION_GENERATED,
 )
-from fastapi import BackgroundTasks, Body, Header, HTTPException, Query
+from fastapi import Body, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from monitoring_adapter.dedup import compute_fingerprint
 from monitoring_adapter.email_ingestion import EmailPollState, ImapConfig, email_to_alert_payload, fetch_unseen_emails
@@ -1080,7 +1079,7 @@ class OnboardingProject(BaseModel):
     repository_url: str = ""
 
     @model_validator(mode="after")
-    def _validate_project(self) -> "OnboardingProject":
+    def _validate_project(self) -> OnboardingProject:
         self.name = str(self.name or "").strip()
         self.owner_team = str(self.owner_team or "").strip()
         self.environment = str(self.environment or "").strip().lower()
@@ -1196,7 +1195,7 @@ class OnboardingConnectivityPayload(BaseModel):
         return normalize_http_endpoint(value, field_name)
 
     @model_validator(mode="after")
-    def _validate_payload(self) -> "OnboardingConnectivityPayload":
+    def _validate_payload(self) -> OnboardingConnectivityPayload:
         self.deployment_mode = str(self.deployment_mode or "cloud_neutral").strip().lower().replace("-", "_")
         if self.deployment_mode not in _ALLOWED_DEPLOYMENT_MODES:
             raise ValueError("deployment_mode must be one of cloud_neutral, on_prem, private_cloud, azure_cloud, aws_cloud, gcp_cloud")
@@ -1313,7 +1312,7 @@ class OnboardingCompletePayload(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def _validate_payload(self) -> "OnboardingCompletePayload":
+    def _validate_payload(self) -> OnboardingCompletePayload:
         if self.selected_monitoring_tool and self.selected_monitoring_tool not in _ALLOWED_ONBOARDING_PROVIDERS:
             raise ValueError("selected_monitoring_tool must be one of prometheus, new_relic, datadog")
         if self.onboarding_path == "setup_monitoring" and not self.plain_language_requirements:
@@ -1486,7 +1485,7 @@ async def _incident_projection_worker() -> None:
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(INCIDENT_PROJECTION_INTERVAL_SECONDS))
             continue
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
         try:
@@ -1530,7 +1529,7 @@ async def _landing_pad_file_watcher() -> None:
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(LANDING_PAD_FILE_WATCHER_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
 
@@ -1582,7 +1581,7 @@ async def _landing_pad_archive_worker() -> None:
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(LANDING_PAD_ARCHIVE_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
 
@@ -1663,7 +1662,7 @@ async def _email_poll_worker() -> None:
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(EMAIL_POLL_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
 
@@ -1745,7 +1744,7 @@ async def _log_poll_worker() -> None:
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(LOG_POLL_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
 
@@ -1781,7 +1780,7 @@ async def _opensearch_log_poll_worker() -> None:
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(OPENSEARCH_LOG_POLL_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
 
@@ -1842,7 +1841,7 @@ async def _jira_poll_worker() -> None:
             _record_worker_failure("jira_poll_worker", exc)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=float(JIRA_POLL_INTERVAL_SECONDS))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
 
@@ -1947,7 +1946,7 @@ async def _jira_action_worker() -> None:
                 logger.exception("Jira action worker scan failed")
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
     finally:
         await client.close()

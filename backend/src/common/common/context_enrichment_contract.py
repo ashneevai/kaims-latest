@@ -6,7 +6,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
 EvidenceCategory = Literal[
     "metrics", "logs", "traces", "topology", "deployment", "change",
     "source_code", "database", "ticket", "runbook", "ownership",

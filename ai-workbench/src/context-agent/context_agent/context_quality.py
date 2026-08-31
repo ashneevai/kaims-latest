@@ -9,9 +9,9 @@ from urllib.parse import urlencode
 from uuid import UUID
 
 from ai_workbench_common.models import Context
-from common.incident_contracts import ContextPackage
-from common.context_enrichment_contract import EvidenceRequirement
 from common.context_enrichment import plan_missing_evidence as plan_missing_evidence_shared
+from common.context_enrichment_contract import EvidenceRequirement
+from common.incident_contracts import ContextPackage
 from common.models import EvidenceReference
 
 CONTEXT_CONTRACT_VERSION = "kaiops.context.v2"

@@ -3,9 +3,9 @@ from uuid import uuid4
 
 import httpx
 import pytest
-from monitoring_adapter.jira_client import JiraClient
 from common.database import MonitoringIntegrationRecord
 from common.repository import ContextEnrichmentRepository
+from monitoring_adapter.jira_client import JiraClient
 
 
 @pytest.mark.asyncio

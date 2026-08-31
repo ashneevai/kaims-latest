@@ -4,7 +4,7 @@ import asyncio
 import logging
 import random
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -211,7 +211,7 @@ class JiraClient:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         del after_issue_key
-        since = (updated_since.astimezone(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
+        since = (updated_since.astimezone(UTC) - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
         jql = (
             f'project = "{self.project_key}" AND updated >= "{since}" '
             "ORDER BY updated ASC, id ASC"
