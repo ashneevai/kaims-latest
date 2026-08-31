@@ -305,6 +305,7 @@ JIRA_API_EMAIL = str(os.getenv("JIRA_API_EMAIL", "") or "").strip()
 JIRA_API_TOKEN = str(os.getenv("JIRA_API_TOKEN", "") or "").strip()
 JIRA_PROJECT_KEY = str(os.getenv("JIRA_PROJECT_KEY", "") or "").strip()
 JIRA_ISSUE_TYPE = str(os.getenv("JIRA_ISSUE_TYPE", "") or "").strip()
+JIRA_TENANT_ID = str(os.getenv("JIRA_TENANT_ID", "default") or "default").strip()
 CENTRALIZED_JIRA_ROUTING_ENABLED = str(os.getenv("CENTRALIZED_JIRA_ROUTING_ENABLED", "false")).strip().lower() in {
     "1",
     "true",
@@ -1954,6 +1955,19 @@ async def _jira_action_worker() -> None:
 
 async def _on_startup(_: Any) -> None:
     app.state.monitoring_adapter_stop_event = asyncio.Event()
+    jira_runtime_ready = settings.database_enabled and all((
+        JIRA_API_BASE_URL, JIRA_API_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, JIRA_ISSUE_TYPE,
+    ))
+    if jira_runtime_ready:
+        async with app.state.session_factory() as session:
+            await ContextEnrichmentRepository(session).ensure_jira_connection_for_project(
+                tenant_id=JIRA_TENANT_ID,
+                project_key=JIRA_PROJECT_KEY,
+                endpoint_url=JIRA_API_BASE_URL,
+                issue_type=JIRA_ISSUE_TYPE,
+                webhook_path="/api/v1/alerts/jira",
+            )
+            await session.commit()
     if INCIDENT_PROJECTION_WORKER_ENABLED:
         app.state.incident_projection_task = asyncio.create_task(_incident_projection_worker())
     if LANDING_PAD_FILE_WATCHER_ENABLED:
@@ -1973,9 +1987,7 @@ async def _on_startup(_: Any) -> None:
             app.state.jira_poll_task = asyncio.create_task(_jira_poll_worker())
         else:
             logger.warning("JIRA_POLLING_ENABLED is true but Jira API credentials are incomplete")
-    if settings.database_enabled and all((
-        JIRA_API_BASE_URL, JIRA_API_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, JIRA_ISSUE_TYPE,
-    )):
+    if jira_runtime_ready:
         app.state.jira_action_task = asyncio.create_task(_jira_action_worker())
     if LOG_INGESTION_ENABLED:
         if LOG_WATCH_PATHS:

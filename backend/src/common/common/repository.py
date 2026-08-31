@@ -9013,6 +9013,68 @@ class ContextEnrichmentRepository(EvaluationRepository):
             raise LookupError("Jira project does not resolve to exactly one active connection")
         return matches[0]
 
+    async def ensure_jira_connection_for_project(
+        self,
+        *,
+        tenant_id: str,
+        project_key: str,
+        endpoint_url: str,
+        issue_type: str,
+        webhook_path: str = "/api/v1/alerts/jira",
+    ) -> MonitoringIntegrationRecord:
+        """Create or refresh the non-secret durable Jira connection metadata.
+
+        Runtime credentials remain in the secret-backed environment.  The
+        durable row gives polling, outbox and webhook processing one stable,
+        connection-scoped identity across restarts.
+        """
+        tenant = require_tenant_id(tenant_id, source="Jira connection")
+        project = self._require("jira_project_key", project_key).upper()
+        endpoint = self._require("jira_endpoint_url", endpoint_url).rstrip("/")
+        issue = self._require("jira_issue_type", issue_type)
+        rows = list((await self.session.execute(select(MonitoringIntegrationRecord).where(
+            MonitoringIntegrationRecord.tenant_id == tenant,
+            MonitoringIntegrationRecord.provider.in_(("jira", "atlassian", "jira_cloud")),
+        ).with_for_update())).scalars().all())
+        matches = [row for row in rows if str(
+            (row.config_payload or {}).get("jira_project_key")
+            or (row.config_payload or {}).get("project_key")
+            or row.project_name
+            or ""
+        ).strip().casefold() == project.casefold()]
+        if len(matches) > 1:
+            raise LookupError("Jira project resolves to multiple durable connections")
+        if matches:
+            row = matches[0]
+        else:
+            row = MonitoringIntegrationRecord(
+                id=uuid5(NAMESPACE_URL, f"kaiops:jira:{tenant}:{endpoint.casefold()}:{project}"),
+                tenant_id=tenant,
+                project_name=project,
+                provider="jira",
+            )
+            self.session.add(row)
+        row.project_name = project
+        row.provider = "jira"
+        row.status = "active"
+        row.active = True
+        row.auth_type = "basic"
+        row.endpoint_url = endpoint
+        row.webhook_path = self._require("jira_webhook_path", webhook_path)
+        row.deployment_mode = "existing_monitoring"
+        row.config_payload = {
+            **dict(row.config_payload or {}),
+            "jira_project_key": project,
+            "jira_issue_type": issue,
+        }
+        row.validation_payload = {
+            **dict(row.validation_payload or {}),
+            "configured": True,
+            "credentials_source": "environment",
+        }
+        await self.session.flush()
+        return row
+
     async def jira_binding_for_issue(
         self,
         *,

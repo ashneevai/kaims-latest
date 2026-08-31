@@ -107,6 +107,34 @@ async def test_jira_actions_and_issue_bindings_are_connection_scoped(sqlite_sess
 
 
 @pytest.mark.asyncio
+async def test_jira_runtime_connection_bootstrap_is_idempotent_and_secret_free(
+    sqlite_session_factory, monkeypatch,
+):
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        first = await repo.ensure_jira_connection_for_project(
+            tenant_id="default", project_key="kan",
+            endpoint_url="https://kaiops-test.atlassian.net/", issue_type="Bug",
+        )
+        first_id = first.id
+        await session.commit()
+
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        second = await repo.ensure_jira_connection_for_project(
+            tenant_id="default", project_key="KAN",
+            endpoint_url="https://kaiops-test.atlassian.net", issue_type="Bug",
+        )
+        resolved = await repo.resolve_jira_connection_for_project(project_key="KAN")
+        assert second.id == first_id == resolved.id
+        assert second.active is True
+        assert second.endpoint_url == "https://kaiops-test.atlassian.net"
+        assert second.config_payload == {"jira_project_key": "KAN", "jira_issue_type": "Bug"}
+        assert "token" not in str(second.config_payload).lower()
+
+
+@pytest.mark.asyncio
 async def test_jira_webhook_receipt_is_durable_and_idempotent(sqlite_session_factory):
     connection_id = uuid4()
     updated_at = datetime(2026, 8, 31, 8, 15, tzinfo=UTC)
