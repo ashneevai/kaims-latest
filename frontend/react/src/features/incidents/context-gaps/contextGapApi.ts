@@ -1,4 +1,4 @@
-import { contextGapInventorySchema, type ContextGapInventory } from "./contextGapSchemas";
+import { contextGapInventoryResponseSchema, type ContextGapInventory } from "./contextGapSchemas";
 
 async function apiRequest(path: string, accessToken: string, init?: RequestInit) {
   const response = await fetch(`/api-gateway${path}`, {
@@ -22,7 +22,7 @@ async function apiRequest(path: string, accessToken: string, init?: RequestInit)
 export async function fetchContextGaps(
   incidentId: string, accessToken: string,
 ): Promise<ContextGapInventory> {
-  return contextGapInventorySchema.parse(
+  return contextGapInventoryResponseSchema.parse(
     await apiRequest(`/incidents/${encodeURIComponent(incidentId)}/context-gaps`, accessToken),
   );
 }
@@ -37,4 +37,3 @@ export async function submitContextGapResponse(
     { method: "POST", body: JSON.stringify({ response, correction }) },
   );
 }
-

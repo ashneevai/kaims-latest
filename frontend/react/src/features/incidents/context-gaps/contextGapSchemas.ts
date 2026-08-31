@@ -37,6 +37,10 @@ export const contextGapInventorySchema = z.object({
   incident_id: z.string(), tenant_id: z.string(), requirements: z.array(contextGapSchema), count: z.number(),
 });
 
+export const contextGapInventoryResponseSchema = z.union([
+  contextGapInventorySchema,
+  z.object({ data: contextGapInventorySchema }).passthrough().transform((value) => value.data),
+]);
+
 export type ContextGap = z.infer<typeof contextGapSchema>;
 export type ContextGapInventory = z.infer<typeof contextGapInventorySchema>;
-

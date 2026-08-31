@@ -29,7 +29,9 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 describe("ContextGapPanel", () => {
   it("renders automatic progress, Jira HITL state, and submits evidence", async () => {
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify(inventory), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        trace_id: "trace-1", gateway: { path: "/incidents/incident-1/context-gaps" }, data: inventory,
+      }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ evidence_id: "HUMAN-1" }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify(inventory), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
@@ -38,6 +40,7 @@ describe("ContextGapPanel", () => {
       roleName="l2_engineer" currentRcaVersion={3} onEvidenceChanged={refresh} />);
 
     expect(await screen.findByText("Which downstream call became slow?")).toBeInTheDocument();
+    expect(screen.queryByText(/invalid_type/)).not.toBeInTheDocument();
     expect(screen.getByText(/KaiMS continues collecting other evidence/)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /OPS-42/ })).toHaveAttribute("href", "https://example.atlassian.net/browse/OPS-42");
     expect(screen.getByText(/retrying · attempt 1/)).toBeInTheDocument();
