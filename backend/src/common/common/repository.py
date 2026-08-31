@@ -4526,6 +4526,12 @@ class IncidentRepository:
         malformed or legacy payload raises validation failure so its caller can
         downgrade integrity to ``contract_invalid``.
         """
+        def contract_timestamp(value: Any) -> Any:
+            parsed = IncidentRepository._parse_datetime(value)
+            if parsed is None:
+                return value
+            return _utc_dt(parsed).isoformat().replace("+00:00", "Z")
+
         metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
         context = context_snapshot.get("context") if isinstance(context_snapshot.get("context"), dict) else {}
         context_metadata = context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
@@ -4564,7 +4570,9 @@ class IncidentRepository:
                 "failed": "unavailable",
             }
             status = status_aliases.get(raw_status, raw_status)
-            collected_at = row.get("collected_at") or context_snapshot.get("collected_at")
+            collected_at = contract_timestamp(
+                row.get("collected_at") or context_snapshot.get("collected_at")
+            )
             sources.append({
                 "source_id": str(source_id),
                 "category": str(row.get("category") or source_id),
@@ -4582,8 +4590,8 @@ class IncidentRepository:
             "project_id": item.get("project_id") or project_id,
             "service": item.get("service") or context.get("alert", {}).get("service") or "unknown",
             "resource_id": item.get("resource_id"),
-            "observed_at": item.get("observed_at"),
-            "collected_at": (
+            "observed_at": contract_timestamp(item.get("observed_at")),
+            "collected_at": contract_timestamp(
                 item.get("collected_at")
                 or (item.get("provenance") or {}).get("generated_at")
                 or context_snapshot.get("collected_at")
@@ -4703,8 +4711,8 @@ class IncidentRepository:
             "context_snapshot_id": context_snapshot.get("snapshot_id"),
             "context_fingerprint": context_snapshot.get("context_fingerprint"),
             "context_contract_version": context_snapshot.get("contract_version"),
-            "context_collected_at": context_snapshot.get("collected_at"),
-            "context_expires_at": context_snapshot.get("expires_at"),
+            "context_collected_at": contract_timestamp(context_snapshot.get("collected_at")),
+            "context_expires_at": contract_timestamp(context_snapshot.get("expires_at")),
             "context_quality": {
                 "evidence_count": len(evidence),
                 "category_coverage": float(

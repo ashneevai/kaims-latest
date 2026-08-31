@@ -31,6 +31,7 @@ from common.database import (
     AlertRecord,
     ApprovalRecord,
     AuditLogRecord,
+    IncidentInvestigationBindingRecord,
     IncidentOccurrenceRecord,
     IncidentProjectionRecord,
     IncidentRecord,
@@ -2111,6 +2112,23 @@ async def _load_analysis_regeneration_subject(
                 previous_rca_version = max(0, int(previous_metadata.get("rca_version") or 0))
             except (TypeError, ValueError):
                 previous_rca_version = 0
+        # The projection advances only after a recommendation is fully
+        # published. A failed or interrupted refresh may already have written
+        # its immutable investigation binding, so projection metadata alone
+        # can reuse that version and violate the binding uniqueness contract
+        # on retry. Treat the durable binding ledger as the version authority.
+        persisted_binding_version = (
+            await session.execute(
+                select(func.max(IncidentInvestigationBindingRecord.rca_version)).where(
+                    IncidentInvestigationBindingRecord.tenant_id == tenant_id,
+                    IncidentInvestigationBindingRecord.incident_id == projection_record.incident_id,
+                )
+            )
+        ).scalar_one_or_none()
+        try:
+            previous_rca_version = max(previous_rca_version, int(persisted_binding_version or 0))
+        except (TypeError, ValueError):
+            pass
         decision["rca_version"] = previous_rca_version + 1
 
     try:

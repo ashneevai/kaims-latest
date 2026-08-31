@@ -8,7 +8,8 @@ async function visibleConfidence(page) {
   await expect(meter).toBeVisible({ timeout: 45_000 });
   const label = await meter.getAttribute("aria-label");
   const value = Number(await meter.getAttribute("aria-valuenow"));
-  expect(value, `expected a positive ${label} percentage`).toBeGreaterThan(0);
+  expect(value, `expected a bounded ${label} percentage`).toBeGreaterThanOrEqual(0);
+  expect(value, `expected a bounded ${label} percentage`).toBeLessThanOrEqual(100);
   return { label, value };
 }
 

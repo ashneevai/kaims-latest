@@ -14,6 +14,7 @@ from common.database import (
     AlertRecord,
     AuditLogRecord,
     HumanCorrectionRecord,
+    IncidentInvestigationBindingRecord,
     IncidentOccurrenceRecord,
     IncidentProjectionRecord,
     IncidentRecord,
@@ -460,6 +461,14 @@ async def test_analysis_regeneration_queues_one_tenant_scoped_command(monkeypatc
             status="investigating", requires_approval=True, policy_version="policy-v9",
             projection_payload={"decision": {"requires_approval": True, "policy_version": "policy-v9"}},
         ))
+        session.add(IncidentInvestigationBindingRecord(
+            binding_id=uuid4(), tenant_id="tenant-a", project_id="kaiops",
+            incident_id=incident_uuid, alert_id=alert_uuid, analysis_request_id=uuid4(),
+            context_snapshot_id=uuid4(), context_fingerprint="a" * 64,
+            recommendation_id=uuid4(), rca_version=7, resolution_plan_id=None,
+            plan_fingerprint=None, status="failed", created_at=datetime.now(UTC),
+            expires_at=datetime.now(UTC),
+        ))
         await session.commit()
 
     async def publish_stub(**kwargs):
@@ -482,6 +491,7 @@ async def test_analysis_regeneration_queues_one_tenant_scoped_command(monkeypatc
     assert captured["command"]["incident"].tenant_id == "tenant-a"
     assert captured["command"]["decision"]["context_strategy"] == "realtime"
     assert captured["command"]["decision"]["force_full_analysis"] is True
+    assert captured["command"]["decision"]["rca_version"] == 8
     assert result["status"] == "accepted"
     assert result["previous_recommendation_id"] == previous_recommendation_id
     assert result["expected_recommendation_id"] == str(module._analysis_recommendation_id(
